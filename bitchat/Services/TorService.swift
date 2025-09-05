@@ -11,8 +11,7 @@ final class TorService: ObservableObject {
     @Published var isEnabled: Bool = UserDefaults.standard.object(forKey: "torEnabled") as? Bool ?? true {
         didSet { UserDefaults.standard.set(isEnabled, forKey: "torEnabled") }
     }
-
-    @Published private(set) var isConnected: Bool = false
+    @Published private(set) var isConnected: Bool = TorManager.shared.connected
     @Published private(set) var isConnecting: Bool = false
     // Simple progress for UI (0-100)
     @Published private(set) var progress: Int = 0
