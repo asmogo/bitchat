@@ -25,9 +25,15 @@ struct BLEDirectLinkState: Equatable {
 struct BLESubscribedCentralSnapshot {
     let centrals: [CBCentral]
     let peerIDsByCentralUUID: [String: PeerID]
+    let primaryCentralIDs: Set<String>
+    let alertOnlyCentralIDs: Set<String>
 
     func central(for peerID: PeerID) -> CBCentral? {
         centrals.first { peerIDsByCentralUUID[$0.identifier.uuidString] == peerID }
+    }
+
+    func usesAlertLane(_ central: CBCentral) -> Bool {
+        alertOnlyCentralIDs.contains(central.identifier.uuidString)
     }
 }
 
@@ -44,7 +50,12 @@ struct BLESubscribedCentralSnapshot {
 /// to have debug builds trap any access from the wrong queue.
 final class BLELinkStateStore {
     private(set) var peripherals: [String: BLEPeripheralLinkState] = [:]
+    /// Full mesh traffic subscribers. A watch removes this subscription while
+    /// backgrounded so presence/sync traffic cannot spend its timely-alert
+    /// budget.
     private(set) var subscribedCentrals: [CBCentral] = []
+    /// Message-only subscribers used by watchOS Bluetooth-alert delivery.
+    private(set) var alertSubscribedCentrals: [CBCentral] = []
 
     #if DEBUG
     private var ownerQueue: DispatchQueue?
@@ -74,7 +85,23 @@ final class BLELinkStateStore {
 
     var subscribedCentralCount: Int {
         assertOwned()
-        return subscribedCentrals.count
+        return allSubscribedCentrals.count
+    }
+
+    var allSubscribedCentrals: [CBCentral] {
+        assertOwned()
+        var result = subscribedCentrals
+        let primaryIDs = Set(result.map(\.identifier))
+        result.append(contentsOf: alertSubscribedCentrals.filter {
+            !primaryIDs.contains($0.identifier)
+        })
+        return result
+    }
+
+    var alertOnlySubscribedCentrals: [CBCentral] {
+        assertOwned()
+        let primaryIDs = Set(subscribedCentrals.map(\.identifier))
+        return alertSubscribedCentrals.filter { !primaryIDs.contains($0.identifier) }
     }
 
     var connectedOrConnectingPeripheralCount: Int {
@@ -157,6 +184,25 @@ final class BLELinkStateStore {
         subscribedCentrals.removeAll { $0.identifier == central.identifier }
     }
 
+    func addAlertSubscribedCentral(_ central: CBCentral) {
+        assertOwned()
+        guard !alertSubscribedCentrals.contains(where: {
+            $0.identifier == central.identifier
+        }) else { return }
+        alertSubscribedCentrals.append(central)
+    }
+
+    func removeAlertSubscribedCentral(_ central: CBCentral) {
+        assertOwned()
+        alertSubscribedCentrals.removeAll { $0.identifier == central.identifier }
+    }
+
+    func hasAnySubscription(from central: CBCentral) -> Bool {
+        assertOwned()
+        return subscribedCentrals.contains { $0.identifier == central.identifier }
+            || alertSubscribedCentrals.contains { $0.identifier == central.identifier }
+    }
+
     func removePeripheral(_ peripheralID: String) {
         assertOwned()
         peripherals.removeValue(forKey: peripheralID)
@@ -170,11 +216,13 @@ final class BLELinkStateStore {
     func clearCentrals() {
         assertOwned()
         subscribedCentrals.removeAll()
+        alertSubscribedCentrals.removeAll()
     }
 
     func clearAll() {
         assertOwned()
         peripherals.removeAll()
         subscribedCentrals.removeAll()
+        alertSubscribedCentrals.removeAll()
     }
 }

@@ -117,6 +117,217 @@ struct WatchParityTests {
         #expect(first.identifier == "dm-message-1")
         #expect(publicMessage.identifier == "public-message-1")
         #expect(first.identifier != publicMessage.identifier)
+        #expect(
+            WatchNotifications.catchUpDescriptor(signalID: "signal-1").identifier
+                == "catchup-signal-1"
+        )
+    }
+
+    @Test("compact phone alert signals decode without entering packet parsing")
+    func timelyAlertSignalCompatibility() throws {
+        var data = Data([
+            0x62, 0x63, 0x68, 0x61, 0x01,
+            MessageType.message.rawValue
+        ])
+        var timestamp = UInt64(42).bigEndian
+        withUnsafeBytes(of: &timestamp) { data.append(contentsOf: $0) }
+        let signal = try #require(WatchTimelyAlertSignal.decode(data))
+
+        #expect(signal.type == MessageType.message.rawValue)
+        #expect(signal.timestamp == 42)
+    }
+
+    @Test("known peer identities survive suspension without becoming active links")
+    func knownPeerPersistence() throws {
+        let suite = "watch-known-peer-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = Data((0..<32).map(UInt8.init))
+        let peerID = PeerID(publicKey: key)
+        let signingKey = Data(repeating: 7, count: 32)
+        let peer = WatchPeer(
+            peerID: peerID,
+            nickname: "alice",
+            noisePublicKey: key,
+            signingPublicKey: signingKey,
+            lastSeen: Date(),
+            capabilities: [.privateMedia]
+        )
+
+        WatchKnownPeerStore(defaults: defaults, storageKey: "peers").remember(peer)
+        let restored = WatchKnownPeerStore(
+            defaults: defaults,
+            storageKey: "peers"
+        ).peer(peerID)
+
+        #expect(restored?.nickname == "alice")
+        #expect(restored?.signingPublicKey == signingKey)
+        #expect(restored?.capabilities == [.privateMedia])
+    }
+
+    @Test("watch mesh keeps discovery armed until Android-compatible link capacity")
+    func persistentDiscoveryCapacity() {
+        #expect(WatchMeshRuntimePolicy.maximumPhysicalLinks == 8)
+        #expect(WatchMeshRuntimePolicy.maximumBackgroundConnections == 2)
+        #expect(WatchMeshRuntimePolicy.shouldKeepDiscoveryArmed(
+            physicalLinks: 0
+        ))
+        #expect(WatchMeshRuntimePolicy.shouldKeepDiscoveryArmed(
+            physicalLinks: 7
+        ))
+        #expect(!WatchMeshRuntimePolicy.shouldKeepDiscoveryArmed(
+            physicalLinks: 8
+        ))
+        #expect(WatchMeshRuntimePolicy.shouldRunDiscovery(
+            isAppInForeground: true,
+            physicalLinks: 0
+        ))
+        #expect(!WatchMeshRuntimePolicy.shouldRunDiscovery(
+            isAppInForeground: false,
+            physicalLinks: 0
+        ))
+        #expect(WatchMeshRuntimePolicy.canStartConnection(
+            physicalLinks: 1,
+            pendingAttempts: 2
+        ))
+        #expect(!WatchMeshRuntimePolicy.canStartConnection(
+            physicalLinks: 1,
+            pendingAttempts: 3
+        ))
+        #expect(!WatchMeshRuntimePolicy.canStartConnection(
+            physicalLinks: 8,
+            pendingAttempts: 0
+        ))
+        #expect(!WatchMeshRuntimePolicy.canStartConnection(
+            physicalLinks: 7,
+            pendingAttempts: 1
+        ))
+        #expect(WatchMeshRuntimePolicy.canStartConnection(
+            physicalLinks: 1,
+            pendingAttempts: 0,
+            isAppInForeground: false
+        ))
+        #expect(!WatchMeshRuntimePolicy.canStartConnection(
+            physicalLinks: 2,
+            pendingAttempts: 0,
+            isAppInForeground: false
+        ))
+    }
+
+    @Test("background relay selection honors the two-link system limit and diversity")
+    func backgroundRelaySelection() {
+        let now = Date()
+        let duplicateStrong = WatchBackgroundRelayCandidate(
+            id: UUID(), peerID: "peer-a", supportsAlertLane: true,
+            rssi: -20, connectedAt: now
+        )
+        let duplicateWeak = WatchBackgroundRelayCandidate(
+            id: UUID(), peerID: "peer-a", supportsAlertLane: true,
+            rssi: -30, connectedAt: now.addingTimeInterval(-30)
+        )
+        let distinct = WatchBackgroundRelayCandidate(
+            id: UUID(), peerID: "peer-b", supportsAlertLane: true,
+            rssi: -60, connectedAt: now.addingTimeInterval(-60)
+        )
+        let legacy = WatchBackgroundRelayCandidate(
+            id: UUID(), peerID: "peer-c", supportsAlertLane: false,
+            rssi: -10, connectedAt: now.addingTimeInterval(-90)
+        )
+        let selected = WatchMeshRuntimePolicy.selectBackgroundRelays([
+            legacy, duplicateWeak, distinct, duplicateStrong
+        ])
+
+        #expect(selected.map(\.id) == [duplicateStrong.id, distinct.id])
+    }
+
+    @Test("connection phases have bounded Android-style recovery deadlines")
+    func boundedConnectionPhases() {
+        #expect(WatchConnectionPhase.connecting.timeout == 30)
+        #expect(WatchConnectionPhase.services.timeout == 15)
+        #expect(WatchConnectionPhase.characteristics.timeout == 15)
+        #expect(WatchConnectionPhase.subscribing.timeout == 15)
+    }
+
+    @Test("candidate ranking prefers diversity, success, fairness, then RSSI")
+    func connectionCandidateRanking() {
+        let now = Date()
+        let duplicate = WatchDiscoveryCandidateScore(
+            id: UUID(),
+            advertisedPeerIsConnected: true,
+            previouslySuccessful: true,
+            lastAttempt: nil,
+            rssi: -20,
+            discoveredAt: now
+        )
+        let reliable = WatchDiscoveryCandidateScore(
+            id: UUID(),
+            advertisedPeerIsConnected: false,
+            previouslySuccessful: true,
+            lastAttempt: now.addingTimeInterval(-60),
+            rssi: -70,
+            discoveredAt: now
+        )
+        let strongNew = WatchDiscoveryCandidateScore(
+            id: UUID(),
+            advertisedPeerIsConnected: false,
+            previouslySuccessful: false,
+            lastAttempt: nil,
+            rssi: -30,
+            discoveredAt: now
+        )
+        let ranked = WatchMeshRuntimePolicy.rankCandidates([
+            duplicate,
+            strongNew,
+            reliable
+        ])
+
+        #expect(ranked.map(\.id) == [reliable.id, strongNew.id, duplicate.id])
+    }
+
+    @Test("peripheral history persists only authenticated identity mappings")
+    func peripheralHistoryPersistence() throws {
+        let suite = "watch-peripheral-history-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let peripheralID = UUID()
+        let peerID = PeerID(publicKey: Data(repeating: 9, count: 32))
+        let successfulAt = Date()
+        let attemptedAt = successfulAt.addingTimeInterval(-100)
+        let store = WatchPeripheralHistoryStore(defaults: defaults, storageKey: "history")
+
+        store.recordAttempt(peripheralID, at: attemptedAt)
+        #expect(store.snapshot(for: peripheralID).peerID == nil)
+        store.recordAuthenticatedPeer(peerID, for: peripheralID, at: successfulAt)
+
+        let restored = WatchPeripheralHistoryStore(
+            defaults: defaults,
+            storageKey: "history"
+        ).snapshot(for: peripheralID)
+        #expect(restored.peerID == peerID.id)
+        #expect(restored.lastAttemptAt == attemptedAt)
+        #expect(restored.lastSuccessfulAt == successfulAt)
+    }
+
+    @Test("background reconnect is immediate and does not expire silent peers")
+    func persistentBackgroundTopology() {
+        #expect(WatchMeshRuntimePolicy.reconnectDelay(
+            isAppInForeground: false,
+            attempt: 5
+        ) == 0)
+        #expect(WatchMeshRuntimePolicy.reconnectDelay(
+            isAppInForeground: true,
+            attempt: 1
+        ) == 1)
+        #expect(WatchMeshRuntimePolicy.reconnectDelay(
+            isAppInForeground: true,
+            attempt: 20
+        ) == 16)
+        #expect(!WatchMeshRuntimePolicy.shouldExpirePeerPresence(
+            isAppInForeground: false
+        ))
+        #expect(WatchMeshRuntimePolicy.shouldExpirePeerPresence(
+            isAppInForeground: true
+        ))
     }
 
     @Test("Bluetooth alert gate releases when visible alert work completes")

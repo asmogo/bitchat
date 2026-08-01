@@ -1,11 +1,59 @@
 import BitFoundation
 import Foundation
 
+enum BLETimelyAlertSignal {
+    private static let magic = Data([0x62, 0x63, 0x68, 0x61]) // "bcha"
+    private static let version: UInt8 = 1
+
+    static func encode(for packet: BitchatPacket) -> Data {
+        var data = magic
+        data.append(version)
+        data.append(packet.type)
+        var timestamp = packet.timestamp.bigEndian
+        withUnsafeBytes(of: &timestamp) { data.append(contentsOf: $0) }
+        return data
+    }
+
+    static func decode(_ data: Data) -> (type: UInt8, timestamp: UInt64)? {
+        guard data.count == magic.count + 10,
+              data.prefix(magic.count) == magic,
+              data[magic.count] == version else { return nil }
+        let type = data[magic.count + 1]
+        let timestamp = data.suffix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        return (type, timestamp)
+    }
+}
+
 enum BLEOutboundPacketPolicy {
     private static let fragmentPayloadHeaderSize = 13
 
     static func messageID(for packet: BitchatPacket) -> String {
         BLEIngressLinkRegistry.messageID(for: packet)
+    }
+
+    /// Traffic allowed onto the watchOS timely-alert lane. Apple grants only a
+    /// handful of timely-alert/background-scan opportunities per day, so only
+    /// packets which can directly become a user-visible message may consume
+    /// one. Fragment trains and handshakes are recovered after that single wake
+    /// on the temporarily reopened full-mesh lane.
+    static func isTimelyAlertCandidate(_ packet: BitchatPacket) -> Bool {
+        switch MessageType(rawValue: packet.type) {
+        case .message, .noiseEncrypted:
+            return true
+        case .none, .announce, .announceV2, .leave, .requestSync, .fragment,
+             .fileTransfer, .courierEnvelope, .boardPost, .ping, .pong,
+             .nostrCarrier, .prekeyBundle, .groupMessage, .voiceFrame,
+             .noiseHandshake:
+            return false
+        }
+    }
+
+    /// Noise packets are already encrypted. Omitting transport padding for the
+    /// watch alert lane avoids turning a short DM into several independent GATT
+    /// updates, each of which can consume scarce watchOS background budget.
+    static func timelyAlertData(for packet: BitchatPacket) -> Data? {
+        guard isTimelyAlertCandidate(packet) else { return nil }
+        return packet.toBinaryData(padding: false)
     }
 
     static func padsBLEFrame(for packetType: UInt8) -> Bool {

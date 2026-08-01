@@ -65,6 +65,7 @@ final class WatchBLEController: NSObject, ObservableObject {
     static let serviceUUID = CBUUID(string: "F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C")
     #endif
     static let characteristicUUID = CBUUID(string: "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D")
+    static let alertCharacteristicUUID = CBUUID(string: "A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5E")
 
     let identity = WatchIdentity.shared
     private lazy var noise = WatchNoiseManager(identity: identity)
@@ -74,6 +75,14 @@ final class WatchBLEController: NSObject, ObservableObject {
     @Published private(set) var running = false
     @Published private(set) var centralState = "unknown"
     @Published private(set) var linkCount = 0
+    @Published private(set) var directLinkCount = 0
+    @Published private(set) var knownPeripheralCount = 0
+    @Published private(set) var connectingLinkCount = 0
+    @Published private(set) var isScanning = false
+    @Published private(set) var connectionStageSummary = "idle"
+    @Published private(set) var recoveryCount = 0
+    @Published private(set) var phaseTimeoutCount = 0
+    @Published private(set) var lastRecoveryReason = "none"
     @Published private(set) var peers: [WatchPeer] = []
     @Published private(set) var messages: [WatchChatMessage] = [] {
         didSet { scheduleConversationPersistence() }
@@ -94,11 +103,38 @@ final class WatchBLEController: NSObject, ObservableObject {
     private var centralManager: CBCentralManager!
     private var peripherals: [UUID: CBPeripheral] = [:]
     private var writableCharacteristics: [UUID: CBCharacteristic] = [:]
+    private var alertCharacteristics: [UUID: CBCharacteristic] = [:]
+    private var announcedReadyLinks: Set<UUID> = []
     private var pendingWrites: [UUID: PendingWriteQueue] = [:]
     private var reconnectAttempts: [UUID: Int] = [:]
     private var reconnectWorkItems: [UUID: DispatchWorkItem] = [:]
+    private var recoveryVerificationWorkItems: [UUID: DispatchWorkItem] = [:]
+    private var connectionRequestedAt: [UUID: Date] = [:]
+    private var peripheralLastDiscoveredAt: [UUID: Date] = [:]
+    private var peripheralRSSI: [UUID: Int] = [:]
+    private var connectedAt: [UUID: Date] = [:]
+    private var retiredDuplicateLinks: Set<UUID> = []
+    private var backgroundParkedLinks: Set<UUID> = []
+    private var lastDiscoveryAt = Date.distantPast
+    private var lastBluetoothProgressAt = Date.distantPast
+    private var lastCentralRebuildAt = Date.distantPast
+    private var consecutivePhaseTimeouts = 0
+    private var scanWatchdog: DispatchSourceTimer?
+    private var candidateDrainWorkItem: DispatchWorkItem?
+    private var connectionPhases: [UUID: ConnectionPhaseState] = [:]
+    private var discoveryCandidates: [UUID: DiscoveryCandidate] = [:]
+    private var pendingTimelyAlertSignalIDs: Set<String> = []
+    /// setNotifyValue is asynchronous. Counts unsubscribe requests whose
+    /// completion callback is still outstanding, so a late "not notifying"
+    /// callback is not mistaken for a peer-initiated subscription loss.
+    private var meshUnsubscribeInFlight: [UUID: Int] = [:]
+    /// True while a Bluetooth-alert wake intentionally holds the full-mesh
+    /// lane open to drain deferred traffic.
+    private var backgroundDrainActive = false
     private let fragmentAssembler = WatchFragmentAssembler()
     private let conversationStore = WatchConversationStore()
+    private let knownPeerStore = WatchKnownPeerStore()
+    private let peripheralHistory = WatchPeripheralHistoryStore()
     private let privateMediaReceipts = PrivateMediaReceiptLedger()
     private let gossipStore = WatchGossipStore()
     private lazy var peerSecurity = WatchPeerSecurityCoordinator(
@@ -121,12 +157,23 @@ final class WatchBLEController: NSObject, ObservableObject {
     private var lastGrantedRuntimeMaintenance = Date.distantPast
     private var activeDMPeer: PeerID?
     private var isPublicConversationActive = false
-    private var isAppInForeground = true
-    private var backgroundReconnectAllowed = false
+    private var isAppInForeground = false
     private var isRestoringConversation = true
     private var conversationPersistenceWorkItem: DispatchWorkItem?
     private lazy var liveVoiceCoordinator = WatchLiveVoiceCoordinator(delegate: self)
     private let bluetoothAlertGate = WatchBluetoothAlertGate()
+
+    private struct ConnectionPhaseState {
+        let phase: WatchConnectionPhase
+        let startedAt: Date
+    }
+
+    private struct DiscoveryCandidate {
+        let peripheral: CBPeripheral
+        var rssi: Int
+        var discoveredAt: Date
+        var advertisedPeerID: String?
+    }
 
     private struct PendingNoisePayload {
         let data: Data
@@ -222,7 +269,11 @@ final class WatchBLEController: NSObject, ObservableObject {
     private static let maxPeerCount = 128
     private static let maxAnnouncedDirectNeighbors = 10
     private static let bluetoothAlertTimeoutNanoseconds: UInt64 = 4_000_000_000
+    private static let bluetoothAlertMinimumDrainNanoseconds: UInt64 = 1_500_000_000
     private static let foregroundAnnounceInterval: TimeInterval = 30
+    /// Suspended processes cannot run timers, so background presence rides on
+    /// granted Bluetooth-alert runtime, bounded to one announce per interval.
+    private static let backgroundAnnounceInterval: TimeInterval = 60
     private static let directAnnounceResponseInterval: TimeInterval = 60
     private static let maxCrossPlatformFragments =
         FragmentationLimits.crossPlatformMaxFragments
@@ -272,6 +323,12 @@ final class WatchBLEController: NSObject, ObservableObject {
             return
         }
         log("start: mesh node \(identity.peerID.id) (\(identity.nickname))")
+        lastBluetoothProgressAt = Date()
+        refreshScanWatchdog()
+        makeCentralManager()
+    }
+
+    private func makeCentralManager() {
         centralManager = CBCentralManager(
             delegate: self,
             queue: nil,
@@ -288,6 +345,10 @@ final class WatchBLEController: NSObject, ObservableObject {
         running = false
         announceHeartbeat?.cancel()
         announceHeartbeat = nil
+        scanWatchdog?.cancel()
+        scanWatchdog = nil
+        candidateDrainWorkItem?.cancel()
+        candidateDrainWorkItem = nil
         log("stop")
         try? logFileHandle?.close()
         logFileHandle = nil
@@ -298,11 +359,25 @@ final class WatchBLEController: NSObject, ObservableObject {
         }
         peripherals.removeAll()
         writableCharacteristics.removeAll()
+        alertCharacteristics.removeAll()
+        announcedReadyLinks.removeAll()
         directPeerByLink.removeAll()
         pendingWrites.removeAll()
         for workItem in reconnectWorkItems.values { workItem.cancel() }
         reconnectWorkItems.removeAll()
+        for workItem in recoveryVerificationWorkItems.values { workItem.cancel() }
+        recoveryVerificationWorkItems.removeAll()
         reconnectAttempts.removeAll()
+        connectionRequestedAt.removeAll()
+        connectionPhases.removeAll()
+        discoveryCandidates.removeAll()
+        meshUnsubscribeInFlight.removeAll()
+        peripheralLastDiscoveredAt.removeAll()
+        peripheralRSSI.removeAll()
+        connectedAt.removeAll()
+        retiredDuplicateLinks.removeAll()
+        backgroundParkedLinks.removeAll()
+        pendingTimelyAlertSignalIDs.removeAll()
         pendingNoisePayloads.removeAll()
         pendingPrivateMediaPayloads.removeAll()
         for workItem in privateMediaRetryWorkItems.values { workItem.cancel() }
@@ -318,29 +393,270 @@ final class WatchBLEController: NSObject, ObservableObject {
         liveVoiceCoordinator.reset()
         noise.clearAll()
         linkCount = 0
+        directLinkCount = 0
+        knownPeripheralCount = 0
+        connectingLinkCount = 0
+        isScanning = false
+        connectionStageSummary = "idle"
+        consecutivePhaseTimeouts = 0
     }
 
     func setAppInForeground(_ foreground: Bool) {
         guard foreground != isAppInForeground else {
-            if !foreground { flushConversationPersistence() }
+            if foreground {
+                adoptSystemConnectedPeripherals()
+                resumeKnownPeripherals()
+                reconcileDiscoveryState()
+                performGrantedRuntimeMaintenance(force: true)
+            } else {
+                adoptSystemConnectedPeripherals()
+                setFullMeshNotifications(enabled: false)
+                enforceBackgroundConnectionBudget()
+                resumeKnownPeripherals()
+                reconcileDiscoveryState()
+                flushConversationPersistence()
+            }
+            refreshAnnounceHeartbeat()
+            refreshScanWatchdog()
+            refreshConnectionDiagnostics()
             return
         }
         isAppInForeground = foreground
         liveVoiceCoordinator.setAppInForeground(foreground)
         if foreground {
-            backgroundReconnectAllowed = false
             backgroundAlertState = "ready"
-            resumeKnownPeripherals(allowReconnect: true)
-            startDiscoveryIfAllowed()
+            backgroundDrainActive = false
+            setFullMeshNotifications(enabled: true)
+            adoptSystemConnectedPeripherals()
+            resumeKnownPeripherals()
+            reconcileDiscoveryState()
             performGrantedRuntimeMaintenance(force: true)
         } else {
-            // Background discoveries and characteristic alerts share the same
-            // tiny watchOS runtime budget. Preserve it for messages from the
-            // already-connected mesh instead of spending it discovering peers.
-            backgroundReconnectAllowed = true
-            centralManager?.stopScan()
+            // Background discovery and timely alerts share the same tiny
+            // watchOS budget. Preserve two deliberately selected relays (the
+            // system's background connection limit), and stop scanning so
+            // advertisements cannot spend opportunities needed for messages.
+            adoptSystemConnectedPeripherals()
+            setFullMeshNotifications(enabled: false)
+            enforceBackgroundConnectionBudget()
+            resumeKnownPeripherals()
+            reconcileDiscoveryState()
             flushConversationPersistence()
         }
+        refreshAnnounceHeartbeat()
+        refreshScanWatchdog()
+        refreshConnectionDiagnostics()
+    }
+
+    private func setFullMeshNotifications(enabled: Bool) {
+        for (uuid, characteristic) in writableCharacteristics {
+            guard let peripheral = peripherals[uuid],
+                  peripheral.state == .connected,
+                  characteristic.isNotifying != enabled else { continue }
+            if !enabled {
+                meshUnsubscribeInFlight[uuid, default: 0] += 1
+            }
+            peripheral.setNotifyValue(enabled, for: characteristic)
+        }
+        log(enabled
+            ? "foreground mesh subscriptions enabled"
+            : "background alert-only subscriptions enabled")
+    }
+
+    /// watchOS supports at most two background BLE connections per app. Carry
+    /// two known-good, distinct alert relays into suspension instead of letting
+    /// the system choose unpredictably. Parked links are reconnected when the
+    /// foreground eight-link mesh resumes.
+    private func enforceBackgroundConnectionBudget() {
+        guard running, !isAppInForeground, let centralManager else { return }
+        let candidates = peripherals.values.compactMap { peripheral -> WatchBackgroundRelayCandidate? in
+            guard peripheral.state == .connected else { return nil }
+            let id = peripheral.identifier
+            let historicalPeerID = peripheralHistory.snapshot(for: id).peerID
+            return WatchBackgroundRelayCandidate(
+                id: id,
+                peerID: directPeerByLink[id]?.id ?? historicalPeerID,
+                supportsAlertLane: alertCharacteristics[id] != nil,
+                rssi: peripheralRSSI[id] ?? -100,
+                connectedAt: connectedAt[id] ?? .distantPast
+            )
+        }
+        let keep = Set(
+            WatchMeshRuntimePolicy.selectBackgroundRelays(candidates).map(\.id)
+        )
+        let extras = candidates.filter { !keep.contains($0.id) }
+        guard !extras.isEmpty else { return }
+        for candidate in extras {
+            guard let peripheral = peripherals[candidate.id] else { continue }
+            backgroundParkedLinks.insert(candidate.id)
+            reconnectWorkItems.removeValue(forKey: candidate.id)?.cancel()
+            connectionRequestedAt.removeValue(forKey: candidate.id)
+            connectionPhases.removeValue(forKey: candidate.id)
+            if let mesh = writableCharacteristics[candidate.id], mesh.isNotifying {
+                meshUnsubscribeInFlight[candidate.id, default: 0] += 1
+                peripheral.setNotifyValue(false, for: mesh)
+            }
+            if let alert = alertCharacteristics[candidate.id], alert.isNotifying {
+                peripheral.setNotifyValue(false, for: alert)
+            }
+            centralManager.cancelPeripheralConnection(peripheral)
+        }
+        log("parked \(extras.count) link(s); preserving \(keep.count) background alert relay(s)")
+        refreshConnectionDiagnostics()
+    }
+
+    private func refreshScanWatchdog() {
+        scanWatchdog?.cancel()
+        scanWatchdog = nil
+        guard running, isAppInForeground, !WatchDemoMode.isEnabled else { return }
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + WatchMeshRuntimePolicy.scanWatchdogInterval,
+            repeating: WatchMeshRuntimePolicy.scanWatchdogInterval,
+            leeway: .seconds(5)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.runForegroundTransportWatchdog()
+        }
+        scanWatchdog = timer
+        timer.resume()
+    }
+
+    private func runForegroundTransportWatchdog(now: Date = Date()) {
+        guard running, isAppInForeground,
+              let centralManager,
+              centralManager.state == .poweredOn else { return }
+
+        expireStalledConnectionPhases(now: now)
+        guard self.centralManager === centralManager else { return }
+        drainDiscoveryCandidates(now: now)
+
+        var rearmedScan = false
+        if shouldKeepDiscoveryArmed,
+           centralManager.isScanning,
+           now.timeIntervalSince(lastDiscoveryAt)
+                >= WatchMeshRuntimePolicy.foregroundScanStaleInterval {
+            log("scan watchdog: rearming stale discovery")
+            centralManager.stopScan()
+            isScanning = false
+            rearmedScan = true
+        }
+
+        if !rearmedScan,
+           announcedReadyLinks.isEmpty,
+           connectionPhases.isEmpty,
+           now.timeIntervalSince(lastBluetoothProgressAt)
+                >= WatchMeshRuntimePolicy.centralRecoveryStaleInterval {
+            rebuildCentralManager(reason: "no Bluetooth progress")
+            return
+        }
+        reconcileDiscoveryState()
+    }
+
+    private func expireStalledConnectionPhases(now: Date) {
+        let expired = connectionPhases.filter {
+            now.timeIntervalSince($0.value.startedAt) >= $0.value.phase.timeout
+        }
+        for (id, state) in expired {
+            consecutivePhaseTimeouts += 1
+            connectionPhases.removeValue(forKey: id)
+            connectionRequestedAt.removeValue(forKey: id)
+            phaseTimeoutCount += 1
+            lastRecoveryReason = "\(state.phase.rawValue) timeout"
+            log("\(state.phase.rawValue) timeout \(id.uuidString.prefix(8))")
+            guard let peripheral = peripherals[id] else { continue }
+            if peripheral.state == .disconnected {
+                scheduleReconnect(peripheral)
+            } else {
+                centralManager?.cancelPeripheralConnection(peripheral)
+                schedulePhaseCancellationVerification(
+                    peripheral,
+                    phase: state.phase
+                )
+            }
+        }
+        refreshConnectionDiagnostics()
+        if consecutivePhaseTimeouts >= 3, announcedReadyLinks.isEmpty {
+            rebuildCentralManager(reason: "repeated connection phase timeouts", now: now)
+        }
+    }
+
+    private func schedulePhaseCancellationVerification(
+        _ peripheral: CBPeripheral,
+        phase: WatchConnectionPhase
+    ) {
+        let id = peripheral.identifier
+        recoveryVerificationWorkItems.removeValue(forKey: id)?.cancel()
+        let workItem = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self else { return }
+            self.recoveryVerificationWorkItems.removeValue(forKey: id)
+            guard let peripheral,
+                  self.running,
+                  self.isAppInForeground,
+                  self.peripherals[id] === peripheral,
+                  peripheral.state != .disconnected else { return }
+            self.rebuildCentralManager(
+                reason: "uncancelled \(phase.rawValue) timeout"
+            )
+        }
+        recoveryVerificationWorkItems[id] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: workItem)
+    }
+
+    private func rebuildCentralManager(reason: String, now: Date = Date()) {
+        guard running, isAppInForeground,
+              now.timeIntervalSince(lastCentralRebuildAt)
+                >= WatchMeshRuntimePolicy.centralRebuildMinimumInterval else { return }
+
+        lastCentralRebuildAt = now
+        lastBluetoothProgressAt = now
+        recoveryCount += 1
+        lastRecoveryReason = reason
+        centralState = "recovering"
+        log("rebuilding Bluetooth central: \(reason)")
+
+        candidateDrainWorkItem?.cancel()
+        candidateDrainWorkItem = nil
+        for workItem in reconnectWorkItems.values { workItem.cancel() }
+        reconnectWorkItems.removeAll()
+        for workItem in recoveryVerificationWorkItems.values { workItem.cancel() }
+        recoveryVerificationWorkItems.removeAll()
+
+        let oldCentral = centralManager
+        oldCentral?.delegate = nil
+        oldCentral?.stopScan()
+        for peripheral in peripherals.values {
+            peripheral.delegate = nil
+            oldCentral?.cancelPeripheralConnection(peripheral)
+        }
+        centralManager = nil
+        clearTransportStateForCentralRebuild()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, self.running, self.centralManager == nil else { return }
+            self.makeCentralManager()
+        }
+    }
+
+    private func clearTransportStateForCentralRebuild() {
+        peripherals.removeAll()
+        writableCharacteristics.removeAll()
+        alertCharacteristics.removeAll()
+        announcedReadyLinks.removeAll()
+        directPeerByLink.removeAll()
+        pendingWrites.removeAll()
+        connectionRequestedAt.removeAll()
+        connectionPhases.removeAll()
+        discoveryCandidates.removeAll()
+        meshUnsubscribeInFlight.removeAll()
+        peripheralLastDiscoveredAt.removeAll()
+        peripheralRSSI.removeAll()
+        connectedAt.removeAll()
+        retiredDuplicateLinks.removeAll()
+        consecutivePhaseTimeouts = 0
+        isScanning = false
+        refreshConnectionDiagnostics()
         refreshAnnounceHeartbeat()
     }
 
@@ -351,30 +667,69 @@ final class WatchBLEController: NSObject, ObservableObject {
     /// the task on that first callback lets watchOS suspend us before the actual
     /// message arrives.
     ///
-    /// This path intentionally avoids discovery, announces, gossip sync, and
-    /// fragment repair. Timely-alert runtime is scarce on watchOS and should be
-    /// spent only on admitting the packet that woke the app.
+    /// Temporarily reopen the full-mesh lane during the granted runtime. The
+    /// alert characteristic is a one-packet wake path; missed public packets
+    /// and deferred directed packets drain on the normal characteristic without
+    /// requiring another background opportunity.
     func handleBluetoothBackgroundWake() async {
         let alertTicket = bluetoothAlertGate.arm()
         await MainActor.run {
-            isAppInForeground = false
-            backgroundReconnectAllowed = true
+            // A bluetoothAlert task can be delivered while the UI is active.
+            // Downgrading real foreground state would silence the announce
+            // heartbeat, the transport watchdog, and presence expiry while
+            // the user is looking at the app.
+            if WKApplication.shared().applicationState != .active {
+                isAppInForeground = false
+                liveVoiceCoordinator.setAppInForeground(false)
+            }
             backgroundAlertState = "waiting"
-            liveVoiceCoordinator.setAppInForeground(false)
             if !running { start() }
-            resumeKnownPeripherals(allowReconnect: true)
+            adoptSystemConnectedPeripherals()
+            enforceBackgroundConnectionBudget()
+            // Hung connection attempts only time out when runtime is granted;
+            // free their pending slots before issuing new requests.
+            expireStalledConnectionPhases(now: Date())
+            backgroundDrainActive = true
+            setFullMeshNotifications(enabled: true)
+            resumeKnownPeripherals()
+            reconcileDiscoveryState()
+            sendBackgroundAnnounceIfDue()
         }
 
-        await bluetoothAlertGate.wait(
+        async let messageCompletion: Void = bluetoothAlertGate.wait(
             alertTicket,
             timeoutNanoseconds: Self.bluetoothAlertTimeoutNanoseconds
         )
+        try? await Task.sleep(
+            nanoseconds: Self.bluetoothAlertMinimumDrainNanoseconds
+        )
+        await messageCompletion
 
-        await MainActor.run {
+        let fallbackSignalID = await MainActor.run { () -> String? in
+            backgroundDrainActive = false
+            // The app may have foregrounded during the drain; only quiet the
+            // lane when it is still backgrounded.
+            if !isAppInForeground {
+                setFullMeshNotifications(enabled: false)
+                enforceBackgroundConnectionBudget()
+            }
             if backgroundAlertState == "waiting" {
                 backgroundAlertState = "idle"
             }
+            reconcileDiscoveryState()
             flushConversationPersistence()
+            let signalID = pendingTimelyAlertSignalIDs.sorted().last
+            pendingTimelyAlertSignalIDs.removeAll()
+            return signalID
+        }
+        if let fallbackSignalID {
+            let error = await WatchNotifications.notifyCatchUpSignal(fallbackSignalID)
+            await MainActor.run {
+                recordNotificationResult(
+                    error,
+                    messageID: "catchup-\(fallbackSignalID)"
+                )
+            }
         }
     }
 
@@ -401,6 +756,19 @@ final class WatchBLEController: NSObject, ObservableObject {
         where !noise.isEstablished(with: peerID) {
             initiateNoiseHandshake(with: peerID)
         }
+    }
+
+    /// Peers expire presence for a node that stops announcing. The announce
+    /// heartbeat cannot run while suspended, so background presence refresh
+    /// rides on granted Bluetooth-alert runtime, rate-limited to keep the
+    /// scarce wake budget for message traffic.
+    private func sendBackgroundAnnounceIfDue() {
+        guard running, !isAppInForeground,
+              centralManager?.state == .poweredOn,
+              !writableCharacteristics.isEmpty,
+              Date().timeIntervalSince(lastAnnounceSentAt)
+                >= Self.backgroundAnnounceInterval else { return }
+        sendAnnounceToAllLinks()
     }
 
     func openDirectMessage(_ peerID: PeerID) {
@@ -690,7 +1058,7 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     func peer(_ peerID: PeerID) -> WatchPeer? {
-        peers.first { $0.peerID == peerID }
+        peers.first { $0.peerID == peerID } ?? knownPeerStore.peer(peerID)
     }
 
     func hasEstablishedSession(_ peerID: PeerID) -> Bool {
@@ -1165,6 +1533,7 @@ final class WatchBLEController: NSObject, ObservableObject {
             peers[index].signingPublicKey = state.signingPublicKey
             peers[index].capabilities = state.capabilities
             peers[index].lastSeen = Date()
+            knownPeerStore.remember(peers[index])
             sortPeers()
         }
     }
@@ -1630,13 +1999,45 @@ final class WatchBLEController: NSObject, ObservableObject {
     ) -> Bool {
         guard packetTTL == WatchPacketFactory.messageTTL else { return false }
         let previous = directPeerByLink.updateValue(peerID, forKey: linkUUID)
+        peripheralHistory.recordAuthenticatedPeer(peerID, for: linkUUID)
+        retireDuplicateDirectLinks(for: peerID)
+        refreshConnectionDiagnostics()
         return previous != peerID
+    }
+
+    private func retireDuplicateDirectLinks(for peerID: PeerID) {
+        let matchingLinks = directPeerByLink.compactMap { linkID, observedPeer in
+            observedPeer == peerID ? linkID : nil
+        }
+        guard matchingLinks.count > 1 else { return }
+
+        guard let winner = matchingLinks.sorted(by: { left, right in
+            let leftReady = announcedReadyLinks.contains(left)
+            let rightReady = announcedReadyLinks.contains(right)
+            if leftReady != rightReady { return leftReady }
+            let leftRSSI = peripheralRSSI[left] ?? Int.min
+            let rightRSSI = peripheralRSSI[right] ?? Int.min
+            if leftRSSI != rightRSSI { return leftRSSI > rightRSSI }
+            return connectedAt[left, default: .distantFuture]
+                < connectedAt[right, default: .distantFuture]
+        }).first else { return }
+
+        for linkID in matchingLinks where linkID != winner {
+            guard let peripheral = peripherals[linkID] else { continue }
+            retiredDuplicateLinks.insert(linkID)
+            directPeerByLink.removeValue(forKey: linkID)
+            connectionRequestedAt.removeValue(forKey: linkID)
+            connectionPhases.removeValue(forKey: linkID)
+            log("retiring duplicate peer link \(linkID.uuidString.prefix(8))")
+            centralManager?.cancelPeripheralConnection(peripheral)
+        }
     }
 
     @discardableResult
     private func removeDirectPeer(on linkUUID: UUID) -> Bool {
         let before = Set(currentDirectNeighbors())
         directPeerByLink.removeValue(forKey: linkUUID)
+        refreshConnectionDiagnostics()
         return Set(currentDirectNeighbors()) != before
     }
 
@@ -1958,6 +2359,7 @@ final class WatchBLEController: NSObject, ObservableObject {
             evictOldestPeerIfNeeded()
             peers.append(entry)
         }
+        knownPeerStore.remember(entry)
         gossipStore.record(packet)
         sortPeers()
 
@@ -2518,6 +2920,7 @@ final class WatchBLEController: NSObject, ObservableObject {
         // announces and fragments use the same characteristic. Release the
         // scarce watchOS background task only after UNUserNotificationCenter has
         // accepted (or rejected) the completely assembled, user-visible message.
+        pendingTimelyAlertSignalIDs.removeAll()
         bluetoothAlertGate.signal()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -2848,8 +3251,20 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     private func touch(_ peerID: PeerID) {
-        guard let index = peers.firstIndex(where: { $0.peerID == peerID }) else { return }
-        peers[index].lastSeen = Date()
+        let now = Date()
+        if let index = peers.firstIndex(where: { $0.peerID == peerID }) {
+            peers[index].lastSeen = now
+            return
+        }
+        // A freshly verified message is presence evidence in its own right.
+        // Restore the cached identity into the active People list so the watch
+        // does not show "0" while displaying that peer's current message.
+        guard var remembered = knownPeerStore.peer(peerID) else { return }
+        remembered.lastSeen = now
+        evictOldestPeerIfNeeded()
+        peers.append(remembered)
+        knownPeerStore.remember(remembered)
+        sortPeers()
     }
 
     private func evictOldestPeerIfNeeded() {
@@ -2887,17 +3302,21 @@ final class WatchBLEController: NSObject, ObservableObject {
         if sentReadReceiptIDs.count > 1_000 {
             sentReadReceiptIDs = Set(sentReadReceiptIDs.suffix(750))
         }
-        let peerCutoff = Date().addingTimeInterval(-180)
+        guard WatchMeshRuntimePolicy.shouldExpirePeerPresence(
+            isAppInForeground: isAppInForeground
+        ) else { return }
+        let peerCutoff = Date().addingTimeInterval(
+            -WatchMeshRuntimePolicy.peerPresenceTimeout
+        )
         let expired = peers.filter { $0.lastSeen < peerCutoff }.map(\.peerID)
         peers.removeAll { $0.lastSeen < peerCutoff }
         for peerID in expired {
-            noise.clear(peerID)
-            peerSecurity.clear(peerID)
+            // Presence and authentication have different lifetimes on
+            // watchOS. Alert-only background links suppress announcements, so
+            // a stale People entry must not destroy a valid Noise session or
+            // pending delivery state. Explicit LEAVE, link/auth failures and
+            // process teardown remain the retirement paths.
             pendingAnnouncements.removeValue(forKey: peerID)
-            deferredEncryptedPackets.removeValue(forKey: peerID)
-            pendingNoisePayloads.removeValue(forKey: peerID)
-            pendingPrivateMediaPayloads.removeValue(forKey: peerID)
-            lastHandshakeAttemptAt.removeValue(forKey: peerID.id)
             lastAnnounceBackAt.removeValue(forKey: peerID.id)
         }
     }
@@ -3119,21 +3538,31 @@ extension WatchBLEController: CBCentralManagerDelegate {
         _ central: CBCentralManager,
         willRestoreState dict: [String: Any]
     ) {
+        guard central === centralManager else { return }
         guard let restored = dict[CBCentralManagerRestoredStatePeripheralsKey]
                 as? [CBPeripheral] else {
             return
         }
         for peripheral in restored {
             peripherals[peripheral.identifier] = peripheral
+            peripheralLastDiscoveredAt[peripheral.identifier] = Date()
             peripheral.delegate = self
+            if peripheral.state == .connecting {
+                connectionRequestedAt[peripheral.identifier] = Date()
+                markConnectionPhase(.connecting, for: peripheral.identifier)
+            } else if peripheral.state == .connected {
+                connectedAt[peripheral.identifier] = Date()
+            }
         }
+        lastBluetoothProgressAt = Date()
         log("restored \(restored.count) Bluetooth link(s)")
-        resumeKnownPeripherals(
-            allowReconnect: isAppInForeground || backgroundReconnectAllowed
-        )
+        resumeKnownPeripherals()
+        enforceBackgroundConnectionBudget()
+        reconcileDiscoveryState()
     }
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard central === centralManager else { return }
         switch central.state {
         case .poweredOn: centralState = "poweredOn"
         case .poweredOff: centralState = "poweredOff"
@@ -3145,38 +3574,277 @@ extension WatchBLEController: CBCentralManagerDelegate {
         }
         log("central state: \(centralState)")
         guard running, central.state == .poweredOn else {
+            if central.state == .poweredOff || central.state == .resetting {
+                connectionRequestedAt.removeAll()
+                connectionPhases.removeAll()
+                discoveryCandidates.removeAll()
+                writableCharacteristics.removeAll()
+                alertCharacteristics.removeAll()
+                announcedReadyLinks.removeAll()
+                directPeerByLink.removeAll()
+                pendingWrites.removeAll()
+                connectedAt.removeAll()
+                refreshConnectionDiagnostics()
+            }
             refreshAnnounceHeartbeat()
             return
         }
-        resumeKnownPeripherals(
-            allowReconnect: isAppInForeground || backgroundReconnectAllowed
+        lastBluetoothProgressAt = Date()
+        adoptSystemConnectedPeripherals()
+        resumeKnownPeripherals()
+        enforceBackgroundConnectionBudget()
+        reconcileDiscoveryState()
+    }
+
+    private var pendingConnectionIDs: Set<UUID> {
+        var result = Set(connectionRequestedAt.keys)
+        for peripheral in peripherals.values {
+            if peripheral.state == .connecting {
+                result.insert(peripheral.identifier)
+            }
+        }
+        return result
+    }
+
+    private var physicalConnectionIDs: Set<UUID> {
+        Set(peripherals.values.compactMap {
+            $0.state == .connected ? $0.identifier : nil
+        })
+    }
+
+    private var shouldKeepDiscoveryArmed: Bool {
+        WatchMeshRuntimePolicy.shouldRunDiscovery(
+            isAppInForeground: isAppInForeground,
+            physicalLinks: physicalConnectionIDs.count
         )
-        startDiscoveryIfAllowed()
+    }
+
+    private func markConnectionPhase(
+        _ phase: WatchConnectionPhase,
+        for id: UUID,
+        at date: Date = Date()
+    ) {
+        connectionPhases[id] = ConnectionPhaseState(phase: phase, startedAt: date)
+        refreshConnectionDiagnostics()
+    }
+
+    private func refreshConnectionDiagnostics() {
+        linkCount = announcedReadyLinks.count
+        directLinkCount = Set(directPeerByLink.values).count
+        knownPeripheralCount = peripherals.count
+        connectingLinkCount = pendingConnectionIDs.count
+        isScanning = centralManager?.isScanning == true
+        let phaseCounts = Dictionary(grouping: connectionPhases.values, by: \.phase)
+        connectionStageSummary = WatchConnectionPhase.allCases.compactMap { phase in
+            guard let count = phaseCounts[phase]?.count, count > 0 else { return nil }
+            return "\(phase.rawValue) \(count)"
+        }.joined(separator: " · ")
+        if connectionStageSummary.isEmpty { connectionStageSummary = "idle" }
+    }
+
+    private func adoptSystemConnectedPeripherals() {
+        guard running, let centralManager, centralManager.state == .poweredOn else { return }
+        let alreadyKnown = Set(peripherals.keys)
+        let connected = centralManager.retrieveConnectedPeripherals(
+            withServices: [Self.serviceUUID]
+        )
+        for peripheral in connected {
+            peripherals[peripheral.identifier] = peripheral
+            peripheralLastDiscoveredAt[peripheral.identifier] = Date()
+            peripheral.delegate = self
+            connectedAt[peripheral.identifier] = connectedAt[peripheral.identifier] ?? Date()
+        }
+        let newlyAdopted = connected.filter { !alreadyKnown.contains($0.identifier) }.count
+        if newlyAdopted > 0 {
+            lastBluetoothProgressAt = Date()
+            log("adopted \(newlyAdopted) system Bluetooth link(s)")
+        }
+        refreshConnectionDiagnostics()
+    }
+
+    private func reconcileDiscoveryState() {
+        guard running, let centralManager, centralManager.state == .poweredOn else {
+            isScanning = false
+            return
+        }
+        if shouldKeepDiscoveryArmed {
+            startDiscoveryIfAllowed()
+        } else if centralManager.isScanning {
+            centralManager.stopScan()
+            isScanning = false
+            log(isAppInForeground
+                ? "scan paused at \(WatchMeshRuntimePolicy.maximumPhysicalLinks)-link capacity"
+                : "scan paused to preserve Bluetooth alert budget")
+        }
+        refreshConnectionDiagnostics()
     }
 
     private func startDiscoveryIfAllowed() {
-        guard running, isAppInForeground || backgroundReconnectAllowed,
-              centralManager?.state == .poweredOn,
-              centralManager?.isScanning == false else { return }
+        guard running, let centralManager, centralManager.state == .poweredOn,
+              shouldKeepDiscoveryArmed,
+              centralManager.isScanning == false else { return }
         centralManager.scanForPeripherals(
             withServices: [Self.serviceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
+        lastDiscoveryAt = Date()
+        isScanning = true
+        log(isAppInForeground
+            ? "filtered discovery armed"
+            : "filtered background discovery armed")
     }
 
-    private func resumeKnownPeripherals(allowReconnect: Bool) {
+    private func resumeKnownPeripherals() {
         guard running, centralManager?.state == .poweredOn else { return }
-        for peripheral in peripherals.values {
+        let ordered = peripherals.values.sorted {
+            let leftConnected = $0.state == .connected
+            let rightConnected = $1.state == .connected
+            if leftConnected != rightConnected { return leftConnected }
+            return peripheralLastDiscoveredAt[$0.identifier, default: .distantPast]
+                > peripheralLastDiscoveredAt[$1.identifier, default: .distantPast]
+        }
+        for peripheral in ordered {
             peripheral.delegate = self
             switch peripheral.state {
             case .connected:
-                peripheral.discoverServices([Self.serviceUUID])
-            case .disconnected where allowReconnect:
-                centralManager.connect(peripheral)
+                connectionRequestedAt.removeValue(forKey: peripheral.identifier)
+                connectedAt[peripheral.identifier] = connectedAt[peripheral.identifier] ?? Date()
+                if !announcedReadyLinks.contains(peripheral.identifier),
+                   connectionPhases[peripheral.identifier] == nil {
+                    markConnectionPhase(.services, for: peripheral.identifier)
+                    peripheral.discoverServices([Self.serviceUUID])
+                }
+            case .disconnected:
+                enqueueDiscoveryCandidate(
+                    peripheral,
+                    rssi: peripheralRSSI[peripheral.identifier] ?? -100,
+                    advertisedPeerID: nil
+                )
             default:
                 break
             }
         }
+        scheduleCandidateDrain()
+        refreshConnectionDiagnostics()
+    }
+
+    @discardableResult
+    private func requestConnection(_ peripheral: CBPeripheral) -> Bool {
+        let id = peripheral.identifier
+        guard running, centralManager?.state == .poweredOn,
+              peripheral.state == .disconnected,
+              connectionRequestedAt[id] == nil,
+              WatchMeshRuntimePolicy.canStartConnection(
+                physicalLinks: physicalConnectionIDs.count,
+                pendingAttempts: pendingConnectionIDs.count,
+                isAppInForeground: isAppInForeground
+              ) else { return false }
+        let now = Date()
+        connectionRequestedAt[id] = now
+        backgroundParkedLinks.remove(id)
+        markConnectionPhase(.connecting, for: id, at: now)
+        peripheralHistory.recordAttempt(id, at: now)
+        centralManager.connect(peripheral)
+        log("connecting \(id.uuidString.prefix(8))")
+        refreshConnectionDiagnostics()
+        reconcileDiscoveryState()
+        return true
+    }
+
+    private func enqueueDiscoveryCandidate(
+        _ peripheral: CBPeripheral,
+        rssi: Int,
+        advertisedPeerID: String?
+    ) {
+        let now = Date()
+        if var existing = discoveryCandidates[peripheral.identifier] {
+            existing.rssi = rssi
+            existing.discoveredAt = now
+            existing.advertisedPeerID = advertisedPeerID ?? existing.advertisedPeerID
+            discoveryCandidates[peripheral.identifier] = existing
+        } else {
+            discoveryCandidates[peripheral.identifier] = DiscoveryCandidate(
+                peripheral: peripheral,
+                rssi: rssi,
+                discoveredAt: now,
+                advertisedPeerID: advertisedPeerID
+            )
+        }
+    }
+
+    private func scheduleCandidateDrain() {
+        candidateDrainWorkItem?.cancel()
+        if !isAppInForeground {
+            drainDiscoveryCandidates()
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.candidateDrainWorkItem = nil
+            self?.drainDiscoveryCandidates()
+        }
+        candidateDrainWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + WatchMeshRuntimePolicy.candidateCollectionInterval,
+            execute: workItem
+        )
+    }
+
+    private func drainDiscoveryCandidates(now: Date = Date()) {
+        discoveryCandidates = discoveryCandidates.filter {
+            now.timeIntervalSince($0.value.discoveredAt)
+                <= WatchMeshRuntimePolicy.candidateRetentionInterval
+                && $0.value.peripheral.state == .disconnected
+        }
+        guard WatchMeshRuntimePolicy.canStartConnection(
+            physicalLinks: physicalConnectionIDs.count,
+            pendingAttempts: pendingConnectionIDs.count,
+            isAppInForeground: isAppInForeground
+        ) else {
+            refreshConnectionDiagnostics()
+            return
+        }
+
+        let connectedPeerIDs = Set(directPeerByLink.values.map(\.id))
+        let scores = discoveryCandidates.values.map { candidate in
+            let history = peripheralHistory.snapshot(for: candidate.peripheral.identifier)
+            let possiblePeerID = history.peerID ?? candidate.advertisedPeerID
+            return WatchDiscoveryCandidateScore(
+                id: candidate.peripheral.identifier,
+                advertisedPeerIsConnected: possiblePeerID.map(connectedPeerIDs.contains) ?? false,
+                previouslySuccessful: history.lastSuccessfulAt != nil,
+                lastAttempt: history.lastAttemptAt,
+                rssi: candidate.rssi,
+                discoveredAt: candidate.discoveredAt
+            )
+        }
+
+        for score in WatchMeshRuntimePolicy.rankCandidates(scores) {
+            guard WatchMeshRuntimePolicy.canStartConnection(
+                physicalLinks: physicalConnectionIDs.count,
+                pendingAttempts: pendingConnectionIDs.count,
+                isAppInForeground: isAppInForeground
+            ) else { break }
+            guard let candidate = discoveryCandidates.removeValue(forKey: score.id) else {
+                continue
+            }
+            let trustedPeerID = peripheralHistory.snapshot(for: score.id).peerID
+            if trustedPeerID.map(connectedPeerIDs.contains) == true {
+                log("skipping duplicate known peer \(score.id.uuidString.prefix(8))")
+                continue
+            }
+            _ = requestConnection(candidate.peripheral)
+        }
+        refreshConnectionDiagnostics()
+    }
+
+    private func advertisedPeerID(
+        from advertisementData: [String: Any]
+    ) -> String? {
+        guard let serviceData = advertisementData[CBAdvertisementDataServiceDataKey]
+                as? [CBUUID: Data],
+              let identityBytes = serviceData[Self.serviceUUID],
+              identityBytes.count >= 8 else { return nil }
+        return identityBytes.prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     func centralManager(
@@ -3185,25 +3853,55 @@ extension WatchBLEController: CBCentralManagerDelegate {
         advertisementData: [String: Any],
         rssi RSSI: NSNumber
     ) {
+        guard running, central === centralManager else { return }
         if peripherals[peripheral.identifier]?.state == .connected { return }
+        let now = Date()
         peripherals[peripheral.identifier] = peripheral
+        peripheralLastDiscoveredAt[peripheral.identifier] = now
+        peripheralRSSI[peripheral.identifier] = RSSI.intValue
+        lastDiscoveryAt = now
+        lastBluetoothProgressAt = now
         peripheral.delegate = self
         let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String
             ?? peripheral.name ?? "bitchat"
         log("discovered \(name) rssi=\(RSSI)")
-        central.connect(peripheral)
+        enqueueDiscoveryCandidate(
+            peripheral,
+            rssi: RSSI.intValue,
+            advertisedPeerID: advertisedPeerID(from: advertisementData)
+        )
+        scheduleCandidateDrain()
+        refreshConnectionDiagnostics()
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard running, central === centralManager,
+              peripherals[peripheral.identifier] === peripheral else { return }
+        let now = Date()
+        lastBluetoothProgressAt = now
+        connectedAt[peripheral.identifier] = now
+        retiredDuplicateLinks.remove(peripheral.identifier)
+        recoveryVerificationWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
         reconnectWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
         reconnectAttempts.removeValue(forKey: peripheral.identifier)
+        connectionRequestedAt.removeValue(forKey: peripheral.identifier)
         let topologyChanged = removeDirectPeer(on: peripheral.identifier)
         writableCharacteristics.removeValue(forKey: peripheral.identifier)
+        alertCharacteristics.removeValue(forKey: peripheral.identifier)
+        announcedReadyLinks.remove(peripheral.identifier)
         pendingWrites.removeValue(forKey: peripheral.identifier)
-        linkCount = writableCharacteristics.count
+        meshUnsubscribeInFlight.removeValue(forKey: peripheral.identifier)
+        refreshConnectionDiagnostics()
         if topologyChanged { sendAnnounceToAllLinks() }
         log("connected \(peripheral.identifier.uuidString.prefix(8))")
+        if !isAppInForeground {
+            enforceBackgroundConnectionBudget()
+            guard peripheral.state == .connected else { return }
+        }
+        markConnectionPhase(.services, for: peripheral.identifier, at: now)
         peripheral.discoverServices([Self.serviceUUID])
+        reconcileDiscoveryState()
+        drainDiscoveryCandidates()
     }
 
     func centralManager(
@@ -3211,9 +3909,16 @@ extension WatchBLEController: CBCentralManagerDelegate {
         didFailToConnect peripheral: CBPeripheral,
         error: Error?
     ) {
-        log("connect failed \(peripheral.identifier.uuidString.prefix(8))")
-        guard isAppInForeground || backgroundReconnectAllowed else { return }
+        guard running, central === centralManager,
+              peripherals[peripheral.identifier] === peripheral else { return }
+        connectionRequestedAt.removeValue(forKey: peripheral.identifier)
+        connectionPhases.removeValue(forKey: peripheral.identifier)
+        recoveryVerificationWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
+        lastRecoveryReason = "connect failed"
+        log("connect failed \(peripheral.identifier.uuidString.prefix(8)): \(error?.localizedDescription ?? "unknown")")
         scheduleReconnect(peripheral)
+        reconcileDiscoveryState()
+        drainDiscoveryCandidates()
     }
 
     func centralManager(
@@ -3221,15 +3926,39 @@ extension WatchBLEController: CBCentralManagerDelegate {
         didDisconnectPeripheral peripheral: CBPeripheral,
         error: Error?
     ) {
+        guard central === centralManager,
+              peripherals[peripheral.identifier] === peripheral else { return }
+        connectionRequestedAt.removeValue(forKey: peripheral.identifier)
+        connectionPhases.removeValue(forKey: peripheral.identifier)
+        recoveryVerificationWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
+        connectedAt.removeValue(forKey: peripheral.identifier)
         let topologyChanged = removeDirectPeer(on: peripheral.identifier)
         writableCharacteristics.removeValue(forKey: peripheral.identifier)
+        alertCharacteristics.removeValue(forKey: peripheral.identifier)
+        announcedReadyLinks.remove(peripheral.identifier)
         pendingWrites.removeValue(forKey: peripheral.identifier)
-        linkCount = writableCharacteristics.count
+        meshUnsubscribeInFlight.removeValue(forKey: peripheral.identifier)
+        refreshConnectionDiagnostics()
         log("disconnected \(peripheral.identifier.uuidString.prefix(8))")
+        guard running else { return }
+        if retiredDuplicateLinks.remove(peripheral.identifier) != nil {
+            log("duplicate link retired")
+            reconcileDiscoveryState()
+            drainDiscoveryCandidates()
+            return
+        }
+        if backgroundParkedLinks.remove(peripheral.identifier) != nil {
+            log("background relay parked \(peripheral.identifier.uuidString.prefix(8))")
+            if isAppInForeground { scheduleReconnect(peripheral) }
+            reconcileDiscoveryState()
+            drainDiscoveryCandidates()
+            return
+        }
         if topologyChanged { sendAnnounceToAllLinks() }
         refreshAnnounceHeartbeat()
-        guard isAppInForeground || backgroundReconnectAllowed else { return }
         scheduleReconnect(peripheral)
+        reconcileDiscoveryState()
+        drainDiscoveryCandidates()
     }
 
     private func scheduleReconnect(_ peripheral: CBPeripheral) {
@@ -3238,29 +3967,51 @@ extension WatchBLEController: CBCentralManagerDelegate {
         reconnectWorkItems.removeValue(forKey: id)?.cancel()
         let attempt = reconnectAttempts[id, default: 0] + 1
         reconnectAttempts[id] = attempt
-        let delay = min(30.0, pow(2.0, Double(min(attempt - 1, 4))))
+        // A nonzero delay rides a DispatchQueue timer, which cannot fire
+        // while the process is suspended. Background retries are handed to
+        // Core Bluetooth immediately as system-owned connection requests;
+        // only foreground retries use bounded backoff.
+        let delay = WatchMeshRuntimePolicy.reconnectDelay(
+            isAppInForeground: isAppInForeground,
+            attempt: attempt
+        )
         let workItem = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self else { return }
             self.reconnectWorkItems.removeValue(forKey: id)
             guard let peripheral, self.running,
                   self.centralManager?.state == .poweredOn,
+                  self.peripherals[id] === peripheral,
                   peripheral.state == .disconnected else { return }
-            self.centralManager?.connect(peripheral)
+            self.enqueueDiscoveryCandidate(
+                peripheral,
+                rssi: self.peripheralRSSI[id] ?? -100,
+                advertisedPeerID: nil
+            )
+            self.scheduleCandidateDrain()
         }
         reconnectWorkItems[id] = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        if delay == 0 {
+            workItem.perform()
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
     }
 }
 
 extension WatchBLEController: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard running else { return }
+        guard running, peripherals[peripheral.identifier] === peripheral else { return }
         guard error == nil,
               let service = peripheral.services?.first(where: { $0.uuid == Self.serviceUUID }) else {
             failLink(peripheral, reason: error?.localizedDescription ?? "bitchat service not found")
             return
         }
-        peripheral.discoverCharacteristics([Self.characteristicUUID], for: service)
+        lastBluetoothProgressAt = Date()
+        markConnectionPhase(.characteristics, for: peripheral.identifier)
+        peripheral.discoverCharacteristics(
+            [Self.characteristicUUID, Self.alertCharacteristicUUID],
+            for: service
+        )
     }
 
     func peripheral(
@@ -3268,22 +4019,43 @@ extension WatchBLEController: CBPeripheralDelegate {
         didDiscoverCharacteristicsFor service: CBService,
         error: Error?
     ) {
-        guard running else { return }
+        guard running, peripherals[peripheral.identifier] === peripheral else { return }
         guard error == nil,
-              let characteristic = service.characteristics?.first(
+              let meshCharacteristic = service.characteristics?.first(
                 where: { $0.uuid == Self.characteristicUUID }
               ),
-              characteristic.properties.contains(.writeWithoutResponse),
-              characteristic.properties.contains(.notify)
-                || characteristic.properties.contains(.indicate) else {
+              meshCharacteristic.properties.contains(.writeWithoutResponse),
+              meshCharacteristic.properties.contains(.notify)
+                || meshCharacteristic.properties.contains(.indicate) else {
             failLink(
                 peripheral,
                 reason: error?.localizedDescription ?? "incompatible characteristic"
             )
             return
         }
-        peripheral.setNotifyValue(true, for: characteristic)
-        log("enabling notifications \(peripheral.identifier.uuidString.prefix(8))")
+        let uuid = peripheral.identifier
+        lastBluetoothProgressAt = Date()
+        writableCharacteristics[uuid] = meshCharacteristic
+        markConnectionPhase(.subscribing, for: uuid)
+        refreshConnectionDiagnostics()
+
+        let alertCharacteristic = service.characteristics?.first(where: {
+            $0.uuid == Self.alertCharacteristicUUID
+                && ($0.properties.contains(.notify) || $0.properties.contains(.indicate))
+        })
+        if let alertCharacteristic {
+            alertCharacteristics[uuid] = alertCharacteristic
+            peripheral.setNotifyValue(true, for: alertCharacteristic)
+            if isAppInForeground {
+                peripheral.setNotifyValue(true, for: meshCharacteristic)
+            }
+            log("enabling dedicated alert lane \(uuid.uuidString.prefix(8))")
+        } else {
+            // Older iOS/Android peers remain interoperable. They use the
+            // original mixed-traffic subscription until upgraded.
+            peripheral.setNotifyValue(true, for: meshCharacteristic)
+            log("peer has no alert lane; using legacy mesh notifications")
+        }
     }
 
     func peripheral(
@@ -3291,21 +4063,63 @@ extension WatchBLEController: CBPeripheralDelegate {
         didUpdateNotificationStateFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        guard running else { return }
-        guard characteristic.uuid == Self.characteristicUUID,
-              error == nil,
-              characteristic.isNotifying else {
-            failLink(
-                peripheral,
-                reason: error?.localizedDescription ?? "notification subscription failed"
-            )
+        guard running, peripherals[peripheral.identifier] === peripheral else { return }
+        let uuid = peripheral.identifier
+        if characteristic.uuid == Self.alertCharacteristicUUID {
+            guard error == nil, characteristic.isNotifying else {
+                alertCharacteristics.removeValue(forKey: uuid)
+                if backgroundParkedLinks.contains(uuid) {
+                    log("alert lane quiet for parked link \(uuid.uuidString.prefix(8))")
+                    return
+                }
+                log("alert lane unavailable; falling back to full mesh")
+                if let mesh = writableCharacteristics[uuid], !mesh.isNotifying {
+                    peripheral.setNotifyValue(true, for: mesh)
+                }
+                return
+            }
+            markLinkReady(peripheral)
             return
         }
-        writableCharacteristics[peripheral.identifier] = characteristic
-        linkCount = writableCharacteristics.count
-        log("link ready mtu=\(peripheral.maximumWriteValueLength(for: .withoutResponse))")
-        sendAnnounce(to: [peripheral.identifier])
-        refreshAnnounceHeartbeat()
+        guard characteristic.uuid == Self.characteristicUUID else { return }
+        if let error {
+            if alertCharacteristics[uuid]?.isNotifying == true {
+                log("full mesh subscription failed; alert lane remains active: \(error.localizedDescription)")
+                return
+            }
+            failLink(peripheral, reason: error.localizedDescription)
+            return
+        }
+        if characteristic.isNotifying {
+            if !isAppInForeground, !backgroundDrainActive,
+               alertCharacteristics[uuid] != nil {
+                // The subscription was requested before a background
+                // transition but completed while suspended. Close the lane
+                // again so routine mesh traffic cannot spend the scarce
+                // timely-alert notification budget.
+                meshUnsubscribeInFlight[uuid, default: 0] += 1
+                peripheral.setNotifyValue(false, for: characteristic)
+                return
+            }
+            markLinkReady(peripheral)
+            // setNotifyValue is asynchronous. Requesting catch-up during a
+            // scene transition can race this callback and lose the response.
+            requestPublicSyncIfNeeded(on: uuid, force: true)
+            requestStalledFragments()
+        } else if let pending = meshUnsubscribeInFlight[uuid], pending > 0 {
+            // Our own unsubscribe request completed; not a peer-initiated
+            // subscription loss.
+            if pending > 1 {
+                meshUnsubscribeInFlight[uuid] = pending - 1
+            } else {
+                meshUnsubscribeInFlight.removeValue(forKey: uuid)
+            }
+            log("mesh lane quiet \(uuid.uuidString.prefix(8))")
+        } else if isAppInForeground || alertCharacteristics[uuid] == nil {
+            failLink(peripheral, reason: "notification subscription ended")
+        } else {
+            log("alert-only link ready \(uuid.uuidString.prefix(8))")
+        }
     }
 
     func peripheral(
@@ -3313,6 +4127,9 @@ extension WatchBLEController: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard running, peripherals[peripheral.identifier] === peripheral else { return }
+        guard characteristic.uuid == Self.characteristicUUID
+                || characteristic.uuid == Self.alertCharacteristicUUID else { return }
         if let error {
             recordBluetoothAlertError(error)
             bluetoothAlertGate.signal()
@@ -3323,8 +4140,47 @@ extension WatchBLEController: CBPeripheralDelegate {
             bluetoothAlertGate.signal()
             return
         }
+        lastBluetoothProgressAt = Date()
         rxBytes += data.count
+        if characteristic.uuid == Self.alertCharacteristicUUID,
+           let signal = WatchTimelyAlertSignal.decode(data) {
+            let signalID = String(
+                format: "%02x-%016llx",
+                signal.type,
+                signal.timestamp
+            )
+            pendingTimelyAlertSignalIDs.insert(signalID)
+            backgroundAlertState = "catching up"
+            log("Bluetooth message signal \(signalID)")
+            return
+        }
         handleIncomingData(data, from: peripheral.identifier)
+    }
+
+    private func markLinkReady(_ peripheral: CBPeripheral) {
+        let uuid = peripheral.identifier
+        guard peripherals[uuid] === peripheral else { return }
+        let now = Date()
+        lastBluetoothProgressAt = now
+        connectionPhases.removeValue(forKey: uuid)
+        connectionRequestedAt.removeValue(forKey: uuid)
+        peripheralHistory.recordSuccess(uuid, at: now)
+        let becameReady = announcedReadyLinks.insert(uuid).inserted
+        consecutivePhaseTimeouts = 0
+        refreshConnectionDiagnostics()
+        reconcileDiscoveryState()
+        guard becameReady else { return }
+        log("link ready mtu=\(peripheral.maximumWriteValueLength(for: .withoutResponse))")
+        sendAnnounce(to: [uuid])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self, weak peripheral] in
+            guard let self, let peripheral,
+                  self.running,
+                  self.peripherals[uuid] === peripheral,
+                  self.announcedReadyLinks.contains(uuid) else { return }
+            self.requestPublicSyncIfNeeded(on: uuid, force: true)
+        }
+        refreshAnnounceHeartbeat()
+        drainDiscoveryCandidates()
     }
 
     func peripheral(
@@ -3332,22 +4188,33 @@ extension WatchBLEController: CBPeripheralDelegate {
         didWriteValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
+        guard peripherals[peripheral.identifier] === peripheral else { return }
         if let error { log("write error: \(error.localizedDescription)") }
     }
 
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        guard peripherals[peripheral.identifier] === peripheral else { return }
         drainPendingWrites(for: peripheral)
     }
 
     private func failLink(_ peripheral: CBPeripheral, reason: String) {
+        guard peripherals[peripheral.identifier] === peripheral else { return }
         let topologyChanged = removeDirectPeer(on: peripheral.identifier)
+        connectionRequestedAt.removeValue(forKey: peripheral.identifier)
+        connectionPhases.removeValue(forKey: peripheral.identifier)
+        recoveryVerificationWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
         writableCharacteristics.removeValue(forKey: peripheral.identifier)
+        alertCharacteristics.removeValue(forKey: peripheral.identifier)
+        announcedReadyLinks.remove(peripheral.identifier)
         pendingWrites.removeValue(forKey: peripheral.identifier)
-        linkCount = writableCharacteristics.count
+        meshUnsubscribeInFlight.removeValue(forKey: peripheral.identifier)
+        refreshConnectionDiagnostics()
+        lastRecoveryReason = reason
         log("link failed \(peripheral.identifier.uuidString.prefix(8)): \(reason)")
         if topologyChanged { sendAnnounceToAllLinks() }
         refreshAnnounceHeartbeat()
         centralManager?.cancelPeripheralConnection(peripheral)
+        reconcileDiscoveryState()
     }
 
     private func recordBluetoothAlertError(_ error: Error) {

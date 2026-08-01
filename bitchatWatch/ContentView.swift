@@ -1215,9 +1215,30 @@ private struct DiagnosticsView: View {
                     .foregroundStyle(WatchPalette.tertiary)
             }
             Text(
-                "links \(ble.linkCount) · rx \(ble.rxBytes) · tx \(ble.txBytes)"
+                "gatt \(ble.linkCount) · direct \(ble.directLinkCount)"
+                    + " · mesh \(ble.peers.count)"
+            )
+                .font(.bitchat(8, weight: .medium))
+                .foregroundStyle(WatchPalette.tertiary)
+            Text(
+                "known \(ble.knownPeripheralCount) · pending \(ble.connectingLinkCount)"
+                    + " · scan \(ble.isScanning ? "on" : "off")"
                     + " · bg \(ble.backgroundAlertState)"
             )
+                .font(.bitchat(8, weight: .medium))
+                .foregroundStyle(WatchPalette.tertiary)
+            Text(
+                "stage \(ble.connectionStageSummary)"
+                    + " · recover \(ble.recoveryCount)/\(ble.phaseTimeoutCount)"
+            )
+                .font(.bitchat(8, weight: .medium))
+                .foregroundStyle(WatchPalette.tertiary)
+            if ble.lastRecoveryReason != "none" {
+                Text("last \(ble.lastRecoveryReason)")
+                    .font(.bitchat(8, weight: .medium))
+                    .foregroundStyle(WatchPalette.tertiary)
+            }
+            Text("rx \(ble.rxBytes) · tx \(ble.txBytes)")
                 .font(.bitchat(8, weight: .medium))
                 .foregroundStyle(WatchPalette.tertiary)
 

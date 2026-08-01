@@ -28,6 +28,7 @@ extension BLEService: CBPeripheralManagerDelegate {
                 peripheral.stopAdvertising()
                 peripheral.removeAllServices()
                 characteristic = nil
+                alertCharacteristic = nil
                 return
             }
             // Remove all services first to ensure clean state
@@ -40,10 +41,16 @@ extension BLEService: CBPeripheralManagerDelegate {
                 value: nil,
                 permissions: [.readable, .writeable]
             )
+            alertCharacteristic = CBMutableCharacteristic(
+                type: BLEService.alertCharacteristicUUID,
+                properties: [.notify],
+                value: nil,
+                permissions: [.readable]
+            )
 
             // Create service
             let service = CBMutableService(type: BLEService.serviceUUID, primary: true)
-            service.characteristics = [characteristic!]
+            service.characteristics = [characteristic!, alertCharacteristic!]
 
             // Add service (advertising will start in didAdd delegate)
             SecureLogger.debug("🔧 Adding BLE service...", category: .session)
@@ -53,12 +60,14 @@ extension BLEService: CBPeripheralManagerDelegate {
             // Bluetooth was turned off - clean up peripheral state
             SecureLogger.info("📴 Bluetooth powered off - cleaning up peripheral state", category: .session)
             // Clear subscribed centrals (they are now invalid)
-            let centralIDs = linkStateStore.subscribedCentrals.map { $0.identifier.uuidString }
+            let centralIDs = linkStateStore.allSubscribedCentrals.map { $0.identifier.uuidString }
             pendingNotifications.removeAll()
+            pendingAlertNotifications.removeAll()
             pendingWriteBuffers.removeAll()
             linkStateStore.clearCentrals()
             subscriptionAnnounceLimiter.removeAll()
             characteristic = nil
+            alertCharacteristic = nil
             emitLinkEvent(.allCentralLinksEnded(centralUUIDs: centralIDs, retireProofsAndNotify: true))
 
         case .unauthorized:
@@ -67,6 +76,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             linkStateStore.clearCentrals()
             subscriptionAnnounceLimiter.removeAll()
             characteristic = nil
+            alertCharacteristic = nil
             emitLinkEvent(.allCentralLinksEnded(centralUUIDs: [], retireProofsAndNotify: false))
 
         case .unsupported:
@@ -91,6 +101,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             peripheral.stopAdvertising()
             peripheral.removeAllServices()
             characteristic = nil
+            alertCharacteristic = nil
             return
         }
         let restoredServices = (dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService]) ?? []
@@ -106,6 +117,14 @@ extension BLEService: CBPeripheralManagerDelegate {
             if let service = restoredServices.first(where: { $0.uuid == BLEService.serviceUUID }),
                let restoredCharacteristic = service.characteristics?.first(where: { $0.uuid == BLEService.characteristicUUID }) as? CBMutableCharacteristic {
                 characteristic = restoredCharacteristic
+            }
+        }
+        if alertCharacteristic == nil {
+            if let service = restoredServices.first(where: { $0.uuid == BLEService.serviceUUID }),
+               let restoredCharacteristic = service.characteristics?.first(where: {
+                   $0.uuid == BLEService.alertCharacteristicUUID
+               }) as? CBMutableCharacteristic {
+                alertCharacteristic = restoredCharacteristic
             }
         }
 
@@ -140,6 +159,12 @@ extension BLEService: CBPeripheralManagerDelegate {
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
         guard !isPanicSuspended else { return }
         let centralUUID = central.identifier.uuidString
+        if characteristic.uuid == BLEService.alertCharacteristicUUID {
+            linkStateStore.addAlertSubscribedCentral(central)
+            SecureLogger.debug("🔔 Central subscribed to alert lane: \(centralUUID.prefix(8))…", category: .session)
+            return
+        }
+        guard characteristic.uuid == BLEService.characteristicUUID else { return }
         SecureLogger.debug("📥 Central subscribed: \(centralUUID.prefix(8))…", category: .session)
         linkStateStore.addSubscribedCentral(central)
 
@@ -172,10 +197,17 @@ extension BLEService: CBPeripheralManagerDelegate {
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic) {
         let centralID = central.identifier.uuidString
-        SecureLogger.debug("📤 Central unsubscribed: \(centralID.prefix(8))…", category: .session)
-        // bleQueue: physical retirement now.
-        pendingNotifications.removeTarget { $0.identifier.uuidString == centralID }
-        linkStateStore.removeSubscribedCentral(central)
+        if characteristic.uuid == BLEService.alertCharacteristicUUID {
+            SecureLogger.debug("🔕 Central left alert lane: \(centralID.prefix(8))…", category: .session)
+            pendingAlertNotifications.removeTarget { $0.identifier.uuidString == centralID }
+            linkStateStore.removeAlertSubscribedCentral(central)
+        } else if characteristic.uuid == BLEService.characteristicUUID {
+            SecureLogger.debug("📤 Central left full-mesh lane: \(centralID.prefix(8))…", category: .session)
+            pendingNotifications.removeTarget { $0.identifier.uuidString == centralID }
+            linkStateStore.removeSubscribedCentral(central)
+        } else {
+            return
+        }
 
         // Ensure we're still advertising for other devices to find us
         if !isPanicSuspended, peripheral.isAdvertising == false {
@@ -183,13 +215,17 @@ extension BLEService: CBPeripheralManagerDelegate {
             peripheral.startAdvertising(BLERadioController.advertisementData())
         }
 
-        // Identity retirement and peer-disconnect bookkeeping ride the
-        // link-event port.
-        emitLinkEvent(.centralLinkEnded(centralUUID: centralID))
+        // Lowered-wrist watches deliberately leave the full-mesh lane.
+        // Preserve their authenticated identity and physical link while the
+        // alert subscription remains alive.
+        if !linkStateStore.hasAnySubscription(from: central) {
+            emitLinkEvent(.centralLinkEnded(centralUUID: centralID))
+        }
     }
     
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
         guard !isPanicSuspended else { return }
+        drainPendingAlertNotifications(logPrefix: "🔔 Sent")
         drainPendingNotifications(logPrefix: "✅ Sent")
     }
 
@@ -212,6 +248,32 @@ extension BLEService: CBPeripheralManagerDelegate {
 
             if sentCount > 0 {
                 self.logBackpressureSampled("\(logPrefix) \(sentCount) pending notifications from retry queue (\(self.pendingNotifications.count) still pending)")
+            }
+        }
+    }
+
+    func drainPendingAlertNotifications(logPrefix: String) {
+        bleQueue.async { [weak self] in
+            guard let self,
+                  let characteristic = self.alertCharacteristic,
+                  !self.pendingAlertNotifications.isEmpty else { return }
+
+            let pending = self.pendingAlertNotifications.takeAll()
+            var sentCount = 0
+            for (index, notification) in pending.enumerated() {
+                let success = self.peripheralManager?.updateValue(
+                    notification.data,
+                    for: characteristic,
+                    onSubscribedCentrals: notification.targets
+                ) ?? false
+                guard success else {
+                    self.pendingAlertNotifications.prepend(Array(pending.dropFirst(index)))
+                    break
+                }
+                sentCount += 1
+            }
+            if sentCount > 0 {
+                self.logBackpressureSampled("\(logPrefix) \(sentCount) pending alert notification(s)")
             }
         }
     }

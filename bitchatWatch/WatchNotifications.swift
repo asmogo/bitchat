@@ -87,6 +87,16 @@ enum WatchNotifications {
         )
     }
 
+    static func catchUpDescriptor(signalID: String) -> Descriptor {
+        Descriptor(
+            identifier: "catchup-\(signalID)",
+            title: "bitchat",
+            body: "New message nearby",
+            threadIdentifier: "mesh-catchup",
+            peerID: nil
+        )
+    }
+
     static func requestAuthorization(completion: @escaping (Bool) -> Void) {
         UNUserNotificationCenter.current().requestAuthorization(
             options: [.alert, .sound]
@@ -145,6 +155,14 @@ enum WatchNotifications {
         )
     }
 
+    static func notifyCatchUpSignal(_ signalID: String) async -> Error? {
+        await withCheckedContinuation { continuation in
+            schedule(catchUpDescriptor(signalID: signalID)) { error in
+                continuation.resume(returning: error)
+            }
+        }
+    }
+
     private static func schedule(
         _ descriptor: Descriptor,
         completion: ((Error?) -> Void)?
@@ -170,7 +188,9 @@ enum WatchNotifications {
             } else {
                 logger.debug("scheduled \(descriptor.identifier, privacy: .public)")
             }
-            completion?(error)
+            DispatchQueue.main.async {
+                completion?(error)
+            }
         }
     }
 

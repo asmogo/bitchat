@@ -15,6 +15,20 @@ import BitFoundation
 import CryptoKit
 import Foundation
 
+enum WatchTimelyAlertSignal {
+    private static let magic = Data([0x62, 0x63, 0x68, 0x61]) // "bcha"
+    private static let version: UInt8 = 1
+
+    static func decode(_ data: Data) -> (type: UInt8, timestamp: UInt64)? {
+        guard data.count == magic.count + 10,
+              data.prefix(magic.count) == magic,
+              data[magic.count] == version else { return nil }
+        let type = data[magic.count + 1]
+        let timestamp = data.suffix(8).reduce(UInt64(0)) { ($0 << 8) | UInt64($1) }
+        return (type, timestamp)
+    }
+}
+
 // MARK: - AnnouncementPacket (mirror of iOS Packets.swift — same TLV bytes)
 
 struct WatchAnnouncementPacket {
