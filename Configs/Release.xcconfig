@@ -10,3 +10,8 @@ CODE_SIGN_STYLE = Automatic
 
 PRODUCT_BUNDLE_IDENTIFIER = chat.bitchat
 APP_GROUP_ID = group.chat.bitchat
+
+// Bundle ID of the iOS companion app, referenced by bitchatWatch/Info.plist.
+// NOTE: must be overridden in Local.xcconfig alongside PRODUCT_BUNDLE_IDENTIFIER,
+// because target-level bundle-ID suffixes would otherwise leak into this value.
+WATCH_COMPANION_BUNDLE_ID = chat.bitchat

@@ -45,7 +45,11 @@ struct BLEOutboundLinkPlannerTests {
             directedOnlyPeer: nil
         )
 
-        #expect(plan.fragmentChunkSize == BLEOutboundPacketPolicy.fragmentChunkSize(forLinkLimit: smallestLimit))
+        #expect(plan.fragmentChunkSize == BLEOutboundPacketPolicy.fragmentChunkSize(
+            forLinkLimit: smallestLimit,
+            packet: packet,
+            hasDirectedRecipient: false
+        ))
         #expect(plan.selectedLinks.peripheralIDs == Set(["p1"]))
         #expect(plan.selectedLinks.centralIDs == Set(["c1"]))
         #expect(!plan.shouldSpoolDirectedPacket)

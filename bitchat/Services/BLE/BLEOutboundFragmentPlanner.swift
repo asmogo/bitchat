@@ -19,8 +19,15 @@ struct BLEOutboundFragmentPlan {
 enum BLEOutboundFragmentPlanner {
     /// Current Android receivers reject fragment sets above 256. Private
     /// media v1 treats that deployed ceiling as a cross-platform contract.
-    static let privateMediaV1MaxFragments = 256
-    private static let minimumChunkSize = 64
+    static let privateMediaV1MaxFragments =
+        FragmentationLimits.crossPlatformMaxFragments
+    /// Both Apple receivers reject larger fragment sets before assembly.
+    /// Keep the sender on the same wire-level ceiling and, importantly, avoid
+    /// trapping when a very small negotiated chunk does not fit in UInt16.
+    private static let protocolMaxFragments = 10_000
+    // The negotiated link limit is authoritative. A 64-byte floor can create
+    // fragments larger than a constrained link's actual write/notify budget.
+    private static let minimumChunkSize = 1
     private static let fragmentIDLength = 8
 
     static func makePlan(
@@ -41,11 +48,18 @@ enum BLEOutboundFragmentPlanner {
             bleMaxMTU: bleMaxMTU
         )
 
+        guard let fragmentCount = FragmentationLimits.requiredFragmentCount(
+            byteCount: fullData.count,
+            chunkSize: sizing.chunkSize
+        ), fragmentCount <= protocolMaxFragments else {
+            return nil
+        }
+
         let chunks = stride(from: 0, to: fullData.count, by: sizing.chunkSize).map { offset in
             Data(fullData[offset..<min(offset + sizing.chunkSize, fullData.count)])
         }
 
-        guard !chunks.isEmpty else { return nil }
+        guard chunks.count == fragmentCount else { return nil }
 
         let fragmentRecipient: Data? = {
             if let directedPeer = request.directedPeer {

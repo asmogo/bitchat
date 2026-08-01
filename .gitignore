@@ -18,6 +18,7 @@ AGENTS.md
 build/
 DerivedData/
 .DerivedData/
+.DerivedData*/
 *.moved-aside
 *.pbxuser
 !default.pbxuser
