@@ -23,9 +23,7 @@ struct BitchatWatchApp: App {
             ContentView(ble: ble)
         }
         .backgroundTask(.bluetoothAlert) {
-            await MainActor.run {
-                ble.handleBluetoothBackgroundWake()
-            }
+            await ble.handleBluetoothBackgroundWake()
         }
     }
 }

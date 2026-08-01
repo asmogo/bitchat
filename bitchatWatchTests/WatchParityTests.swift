@@ -77,6 +77,79 @@ struct WatchParityTests {
         #expect(WatchBLEController.maxPrivateContentBytes == 255)
     }
 
+    @Test("notification policy alerts unless the receiving conversation is visible")
+    func notificationPolicy() {
+        #expect(WatchNotifications.shouldScheduleAlert(
+            isAppInForeground: false,
+            isConversationActive: true
+        ))
+        #expect(WatchNotifications.shouldScheduleAlert(
+            isAppInForeground: true,
+            isConversationActive: false
+        ))
+        #expect(!WatchNotifications.shouldScheduleAlert(
+            isAppInForeground: true,
+            isConversationActive: true
+        ))
+    }
+
+    @Test("notification identifiers are stable for system deduplication")
+    func stableNotificationIdentifiers() {
+        let first = WatchNotifications.directMessageDescriptor(
+            messageID: "message-1",
+            peerID: "peer-1",
+            sender: "alice",
+            preview: "hello"
+        )
+        let replay = WatchNotifications.directMessageDescriptor(
+            messageID: "message-1",
+            peerID: "peer-1",
+            sender: "alice",
+            preview: "hello"
+        )
+        let publicMessage = WatchNotifications.publicMessageDescriptor(
+            messageID: "message-1",
+            sender: "alice",
+            preview: "hello"
+        )
+
+        #expect(first == replay)
+        #expect(first.identifier == "dm-message-1")
+        #expect(publicMessage.identifier == "public-message-1")
+        #expect(first.identifier != publicMessage.identifier)
+    }
+
+    @Test("Bluetooth alert gate releases when visible alert work completes")
+    func bluetoothAlertGateSignal() async {
+        let gate = WatchBluetoothAlertGate()
+        let ticket = gate.arm()
+        let waiter = Task {
+            await gate.wait(ticket, timeoutNanoseconds: 2_000_000_000)
+        }
+
+        gate.signal()
+        await waiter.value
+        #expect(gate.pendingCount == 0)
+    }
+
+    @Test("Bluetooth alert gate remembers completion before async wait starts")
+    func bluetoothAlertGateEarlySignal() async {
+        let gate = WatchBluetoothAlertGate()
+        let ticket = gate.arm()
+        gate.signal()
+
+        await gate.wait(ticket, timeoutNanoseconds: 2_000_000_000)
+        #expect(gate.pendingCount == 0)
+    }
+
+    @Test("Bluetooth alert gate has a bounded timeout")
+    func bluetoothAlertGateTimeout() async {
+        let gate = WatchBluetoothAlertGate()
+        let ticket = gate.arm()
+        await gate.wait(ticket, timeoutNanoseconds: 1_000_000)
+        #expect(gate.pendingCount == 0)
+    }
+
     @Test("authenticated state belongs to one exact Noise generation")
     func generationBoundPeerState() {
         let store = MemoryPeerStateStore()

@@ -989,7 +989,7 @@ private struct NotificationSetupView: View {
             Text("Message alerts")
                 .font(.bitchat(15, weight: .bold))
                 .foregroundStyle(WatchPalette.green)
-            Text("Alerts for encrypted direct messages")
+            Text("Alerts for direct and nearby messages")
                 .font(.bitchat(11, weight: .medium))
                 .foregroundStyle(WatchPalette.tertiary)
                 .multilineTextAlignment(.center)
@@ -1214,7 +1214,10 @@ private struct DiagnosticsView: View {
                     .font(.bitchat(8, weight: .medium))
                     .foregroundStyle(WatchPalette.tertiary)
             }
-            Text("links \(ble.linkCount) · rx \(ble.rxBytes) · tx \(ble.txBytes)")
+            Text(
+                "links \(ble.linkCount) · rx \(ble.rxBytes) · tx \(ble.txBytes)"
+                    + " · bg \(ble.backgroundAlertState)"
+            )
                 .font(.bitchat(8, weight: .medium))
                 .foregroundStyle(WatchPalette.tertiary)
 

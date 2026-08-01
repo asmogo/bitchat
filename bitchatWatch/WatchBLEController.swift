@@ -89,6 +89,7 @@ final class WatchBLEController: NSObject, ObservableObject {
     @Published private(set) var logLines: [String] = []
     @Published private(set) var trustRevision = 0
     @Published private(set) var activePublicVoiceTalker: String?
+    @Published private(set) var backgroundAlertState = "idle"
 
     private var centralManager: CBCentralManager!
     private var peripherals: [UUID: CBPeripheral] = [:]
@@ -125,6 +126,7 @@ final class WatchBLEController: NSObject, ObservableObject {
     private var isRestoringConversation = true
     private var conversationPersistenceWorkItem: DispatchWorkItem?
     private lazy var liveVoiceCoordinator = WatchLiveVoiceCoordinator(delegate: self)
+    private let bluetoothAlertGate = WatchBluetoothAlertGate()
 
     private struct PendingNoisePayload {
         let data: Data
@@ -219,8 +221,8 @@ final class WatchBLEController: NSObject, ObservableObject {
     private static let maxPendingNoisePayloadsPerPeer = 16
     private static let maxPeerCount = 128
     private static let maxAnnouncedDirectNeighbors = 10
+    private static let bluetoothAlertTimeoutNanoseconds: UInt64 = 4_000_000_000
     private static let foregroundAnnounceInterval: TimeInterval = 30
-    private static let backgroundAnnounceInterval: TimeInterval = 60
     private static let directAnnounceResponseInterval: TimeInterval = 60
     private static let maxCrossPlatformFragments =
         FragmentationLimits.crossPlatformMaxFragments
@@ -327,34 +329,53 @@ final class WatchBLEController: NSObject, ObservableObject {
         liveVoiceCoordinator.setAppInForeground(foreground)
         if foreground {
             backgroundReconnectAllowed = false
+            backgroundAlertState = "ready"
             resumeKnownPeripherals(allowReconnect: true)
             startDiscoveryIfAllowed()
             performGrantedRuntimeMaintenance(force: true)
         } else {
-            // A service-filtered Core Bluetooth scan started in the foreground
-            // can continue after watchOS suspends the UI. Keep it armed so a
-            // newly advertising mesh peer can wake us for a short connection
-            // opportunity, and allow known links to reconnect while backgrounded.
+            // Background discoveries and characteristic alerts share the same
+            // tiny watchOS runtime budget. Preserve it for messages from the
+            // already-connected mesh instead of spending it discovering peers.
             backgroundReconnectAllowed = true
-            startDiscoveryIfAllowed()
+            centralManager?.stopScan()
             flushConversationPersistence()
         }
         refreshAnnounceHeartbeat()
     }
 
-    /// Called by SwiftUI's Bluetooth-alert background task. watchOS grants a
-    /// short wake for an already subscribed GATT characteristic; this restores
-    /// the central, its links, and the service-filtered discovery request.
-    func handleBluetoothBackgroundWake() {
-        isAppInForeground = false
-        backgroundReconnectAllowed = true
-        liveVoiceCoordinator.setAppInForeground(false)
-        if !running { start() }
-        resumeKnownPeripherals(allowReconnect: true)
-        startDiscoveryIfAllowed()
-        refreshAnnounceHeartbeat()
-        performGrantedRuntimeMaintenance(force: true)
-        flushConversationPersistence()
+    /// Called by SwiftUI's Bluetooth-alert background task. Keep the task open
+    /// until a user-visible message has been fully admitted and handed to the
+    /// notification center (or a short timeout expires). A characteristic
+    /// callback can contain an announce, a receipt, or only one fragment; ending
+    /// the task on that first callback lets watchOS suspend us before the actual
+    /// message arrives.
+    ///
+    /// This path intentionally avoids discovery, announces, gossip sync, and
+    /// fragment repair. Timely-alert runtime is scarce on watchOS and should be
+    /// spent only on admitting the packet that woke the app.
+    func handleBluetoothBackgroundWake() async {
+        let alertTicket = bluetoothAlertGate.arm()
+        await MainActor.run {
+            isAppInForeground = false
+            backgroundReconnectAllowed = true
+            backgroundAlertState = "waiting"
+            liveVoiceCoordinator.setAppInForeground(false)
+            if !running { start() }
+            resumeKnownPeripherals(allowReconnect: true)
+        }
+
+        await bluetoothAlertGate.wait(
+            alertTicket,
+            timeoutNanoseconds: Self.bluetoothAlertTimeoutNanoseconds
+        )
+
+        await MainActor.run {
+            if backgroundAlertState == "waiting" {
+                backgroundAlertState = "idle"
+            }
+            flushConversationPersistence()
+        }
     }
 
     /// watchOS does not grant a continuously executing foreground service.
@@ -1622,18 +1643,16 @@ final class WatchBLEController: NSObject, ObservableObject {
     private func refreshAnnounceHeartbeat() {
         announceHeartbeat?.cancel()
         announceHeartbeat = nil
-        guard running, !WatchDemoMode.isEnabled,
+        guard running, isAppInForeground, !WatchDemoMode.isEnabled,
               centralManager?.state == .poweredOn,
               !writableCharacteristics.isEmpty else { return }
 
-        let interval = isAppInForeground
-            ? Self.foregroundAnnounceInterval
-            : Self.backgroundAnnounceInterval
+        let interval = Self.foregroundAnnounceInterval
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(
             deadline: .now() + interval,
             repeating: interval,
-            leeway: .seconds(isAppInForeground ? 5 : 15)
+            leeway: .seconds(5)
         )
         timer.setEventHandler { [weak self] in
             guard let self, self.running,
@@ -1671,12 +1690,6 @@ final class WatchBLEController: NSObject, ObservableObject {
         }
         if isForLocalDelivery(packet) {
             process(packet, from: senderPeer, linkUUID: linkUUID)
-        }
-        if !isAppInForeground {
-            // An incoming characteristic update is granted Bluetooth runtime
-            // even when a separate SwiftUI background-task callback is not
-            // delivered first. Use that opportunity to catch up mesh work.
-            performGrantedRuntimeMaintenance()
         }
     }
 
@@ -1999,7 +2012,20 @@ final class WatchBLEController: NSObject, ObservableObject {
             media: nil
         ))
         trimTimelineIfNeeded()
-        WKInterfaceDevice.current().play(.notification)
+        if WatchNotifications.shouldScheduleAlert(
+            isAppInForeground: isAppInForeground,
+            isConversationActive: isPublicConversationActive
+        ) {
+            WatchNotifications.notifyPublicMessage(
+                messageID: messageID,
+                sender: knownPeer.nickname,
+                preview: content
+            ) { [weak self] error in
+                self?.recordNotificationResult(error, messageID: messageID)
+            }
+        } else {
+            WKInterfaceDevice.current().play(.notification)
+        }
     }
 
     private func handlePublicVoiceFrame(
@@ -2176,7 +2202,23 @@ final class WatchBLEController: NSObject, ObservableObject {
         } else {
             messages.append(message)
             trimTimelineIfNeeded()
-            WKInterfaceDevice.current().play(.notification)
+            if WatchNotifications.shouldScheduleAlert(
+                isAppInForeground: isAppInForeground,
+                isConversationActive: isPublicConversationActive
+            ) {
+                let preview = attachment.kind == .audio
+                    ? "Voice message"
+                    : attachment.fileName
+                WatchNotifications.notifyPublicMessage(
+                    messageID: messageID,
+                    sender: nickname,
+                    preview: preview
+                ) { [weak self] error in
+                    self?.recordNotificationResult(error, messageID: messageID)
+                }
+            } else {
+                WKInterfaceDevice.current().play(.notification)
+            }
         }
     }
 
@@ -2446,7 +2488,11 @@ final class WatchBLEController: NSObject, ObservableObject {
         if sendsReceipts {
             sendReceipt(type: .delivered, messageID: id, to: peerID)
         }
-        if isAppInForeground, activeDMPeer == peerID {
+        let shouldScheduleAlert = WatchNotifications.shouldScheduleAlert(
+            isAppInForeground: isAppInForeground,
+            isConversationActive: activeDMPeer == peerID
+        )
+        if !shouldScheduleAlert {
             if sendsReceipts {
                 sendReadReceiptIfNeeded(messageID: id, to: peerID)
             }
@@ -2454,12 +2500,38 @@ final class WatchBLEController: NSObject, ObservableObject {
             unreadDms[peerID.id, default: 0] += 1
             sortPeers()
             WatchNotifications.notifyDirectMessage(
+                messageID: id,
                 peerID: peerID.id,
                 sender: sender,
                 preview: preview
-            )
+            ) { [weak self] error in
+                self?.recordNotificationResult(error, messageID: id)
+            }
         }
-        WKInterfaceDevice.current().play(.notification)
+        if !shouldScheduleAlert {
+            WKInterfaceDevice.current().play(.notification)
+        }
+    }
+
+    private func recordNotificationResult(_ error: Error?, messageID: String) {
+        // The Bluetooth callback which woke us is not necessarily the message:
+        // announces and fragments use the same characteristic. Release the
+        // scarce watchOS background task only after UNUserNotificationCenter has
+        // accepted (or rejected) the completely assembled, user-visible message.
+        bluetoothAlertGate.signal()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let error {
+                self.backgroundAlertState = "notification error"
+                self.log(
+                    "notification failed \(messageID.prefix(12)): "
+                        + error.localizedDescription
+                )
+            } else {
+                self.backgroundAlertState = "notified"
+                self.log("notification scheduled \(messageID.prefix(12))")
+            }
+        }
     }
 
     private func sendReadReceiptIfNeeded(messageID: String, to peerID: PeerID) {
@@ -3241,7 +3313,16 @@ extension WatchBLEController: CBPeripheralDelegate {
         didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        guard error == nil, let data = characteristic.value, !data.isEmpty else { return }
+        if let error {
+            recordBluetoothAlertError(error)
+            bluetoothAlertGate.signal()
+            return
+        }
+        guard let data = characteristic.value, !data.isEmpty else {
+            log("Bluetooth alert delivered no data")
+            bluetoothAlertGate.signal()
+            return
+        }
         rxBytes += data.count
         handleIncomingData(data, from: peripheral.identifier)
     }
@@ -3267,5 +3348,21 @@ extension WatchBLEController: CBPeripheralDelegate {
         if topologyChanged { sendAnnounceToAllLinks() }
         refreshAnnounceHeartbeat()
         centralManager?.cancelPeripheralConnection(peripheral)
+    }
+
+    private func recordBluetoothAlertError(_ error: Error) {
+        let nsError = error as NSError
+        let code = CBError.Code(rawValue: nsError.code)
+        switch code {
+        case .leGattNearBackgroundNotificationLimit:
+            backgroundAlertState = "near limit"
+            log("Bluetooth background alert budget is nearly exhausted")
+        case .leGattExceededBackgroundNotificationLimit:
+            backgroundAlertState = "limit exceeded"
+            log("Bluetooth background alert budget exhausted; open bitchat to reset it")
+        default:
+            backgroundAlertState = "error"
+            log("Bluetooth value update failed: \(error.localizedDescription)")
+        }
     }
 }
