@@ -399,6 +399,8 @@ final class WatchBLEController: NSObject, ObservableObject {
         isScanning = false
         connectionStageSummary = "idle"
         consecutivePhaseTimeouts = 0
+        backgroundDrainActive = false
+        backgroundAlertState = "idle"
     }
 
     func setAppInForeground(_ foreground: Bool) {
@@ -449,18 +451,33 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     private func setFullMeshNotifications(enabled: Bool) {
+        var legacyLanesKept = 0
         for (uuid, characteristic) in writableCharacteristics {
             guard let peripheral = peripherals[uuid],
                   peripheral.state == .connected,
                   characteristic.isNotifying != enabled else { continue }
+            if !enabled,
+               !WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
+                   hasAlertLane: alertCharacteristics[uuid] != nil
+               ) {
+                legacyLanesKept += 1
+                continue
+            }
             if !enabled {
                 meshUnsubscribeInFlight[uuid, default: 0] += 1
             }
             peripheral.setNotifyValue(enabled, for: characteristic)
         }
-        log(enabled
-            ? "foreground mesh subscriptions enabled"
-            : "background alert-only subscriptions enabled")
+        if enabled {
+            log("foreground mesh subscriptions enabled")
+        } else {
+            log(
+                "background alert-only subscriptions enabled"
+                    + (legacyLanesKept > 0
+                        ? "; kept \(legacyLanesKept) legacy mesh lane(s)"
+                        : "")
+            )
+        }
     }
 
     /// watchOS supports at most two background BLE connections per app. Carry
@@ -3894,7 +3911,7 @@ extension WatchBLEController: CBCentralManagerDelegate {
         refreshConnectionDiagnostics()
         if topologyChanged { sendAnnounceToAllLinks() }
         log("connected \(peripheral.identifier.uuidString.prefix(8))")
-        if !isAppInForeground {
+        if !isAppInForeground, !backgroundDrainActive {
             enforceBackgroundConnectionBudget()
             guard peripheral.state == .connected else { return }
         }
@@ -4046,7 +4063,7 @@ extension WatchBLEController: CBPeripheralDelegate {
         if let alertCharacteristic {
             alertCharacteristics[uuid] = alertCharacteristic
             peripheral.setNotifyValue(true, for: alertCharacteristic)
-            if isAppInForeground {
+            if isAppInForeground || backgroundDrainActive {
                 peripheral.setNotifyValue(true, for: meshCharacteristic)
             }
             log("enabling dedicated alert lane \(uuid.uuidString.prefix(8))")
@@ -4176,7 +4193,8 @@ extension WatchBLEController: CBPeripheralDelegate {
             guard let self, let peripheral,
                   self.running,
                   self.peripherals[uuid] === peripheral,
-                  self.announcedReadyLinks.contains(uuid) else { return }
+                  self.announcedReadyLinks.contains(uuid),
+                  self.writableCharacteristics[uuid]?.isNotifying == true else { return }
             self.requestPublicSyncIfNeeded(on: uuid, force: true)
         }
         refreshAnnounceHeartbeat()

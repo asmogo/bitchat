@@ -67,6 +67,14 @@ enum WatchMeshRuntimePolicy {
     static func shouldExpirePeerPresence(isAppInForeground: Bool) -> Bool {
         isAppInForeground
     }
+
+    /// A link without a dedicated alert characteristic has no other wake
+    /// path. Quieting its mesh subscription wrist-down would make the watch
+    /// permanently deaf to that legacy peer, so only alert-capable links are
+    /// reduced to the alert lane.
+    static func shouldQuietMeshLaneInBackground(hasAlertLane: Bool) -> Bool {
+        hasAlertLane
+    }
 }
 
 enum WatchConnectionPhase: String, CaseIterable {

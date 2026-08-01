@@ -147,12 +147,6 @@
 			);
 			target = B1DC0FFEE100000000000001 /* bitchat_watchOS */;
 		};
-		B1DC0FFEE100000000000022 /* Exceptions for "bitchatWatchTests" folder in "bitchatWatchTests" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-			);
-			target = B1DC0FFEE100000000000027 /* bitchatWatchTests */;
-		};
 		C5E027A52ECCDFD700BD6012 /* Exceptions for "bitchatTests" folder in "bitchatTests_macOS" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
@@ -216,9 +210,6 @@
 		};
 		B1DC0FFEE100000000000023 /* bitchatWatchTests */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-				B1DC0FFEE100000000000022 /* Exceptions for "bitchatWatchTests" folder in "bitchatWatchTests" target */,
-			);
 			path = bitchatWatchTests;
 			sourceTree = "<group>";
 		};
@@ -513,7 +504,7 @@
 			preferredProjectObjectVersion = 90;
 			projectDirPath = "";
 			projectRoot = "";
-				targets = (
+			targets = (
 				B1DC0FFEE100000000000001 /* bitchat_watchOS */,
 				B1DC0FFEE100000000000027 /* bitchatWatchTests */,
 				57CA17A36A2532A6CFF367BB /* bitchatShareExtension */,
@@ -639,54 +630,6 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		B1DC0FFEE10000000000002A /* Debug configuration for PBXNativeTarget "bitchatWatchTests" */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
-			baseConfigurationReferenceRelativePath = Debug.xcconfig;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGNING_ALLOWED = YES;
-				CODE_SIGNING_REQUIRED = YES;
-				CODE_SIGN_STYLE = "$(CODE_SIGN_STYLE)";
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@loader_path/Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).watchtests";
-				SDKROOT = watchos;
-				SWIFT_VERSION = "$(SWIFT_VERSION)";
-				TARGETED_DEVICE_FAMILY = 4;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/bitchat";
-				WATCHOS_DEPLOYMENT_TARGET = 10.0;
-			};
-			name = Debug;
-		};
-		B1DC0FFEE10000000000002B /* Release configuration for PBXNativeTarget "bitchatWatchTests" */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
-			baseConfigurationReferenceRelativePath = Release.xcconfig;
-			buildSettings = {
-				BUNDLE_LOADER = "$(TEST_HOST)";
-				CODE_SIGNING_ALLOWED = YES;
-				CODE_SIGNING_REQUIRED = YES;
-				CODE_SIGN_STYLE = "$(CODE_SIGN_STYLE)";
-				GENERATE_INFOPLIST_FILE = YES;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@loader_path/Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).watchtests";
-				SDKROOT = watchos;
-				SWIFT_VERSION = "$(SWIFT_VERSION)";
-				TARGETED_DEVICE_FAMILY = 4;
-				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/bitchat";
-				WATCHOS_DEPLOYMENT_TARGET = 10.0;
-			};
-			name = Release;
-		};
 		077A5203074247CF8F766E2F /* Debug configuration for PBXNativeTarget "bitchatTests_iOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
@@ -801,6 +744,7 @@
 				CODE_SIGN_ENTITLEMENTS = bitchat/bitchat.entitlements;
 				CODE_SIGN_STYLE = "$(CODE_SIGN_STYLE)";
 				DEVELOPMENT_ASSET_PATHS = bitchat/_PreviewHelpers;
+				DEVELOPMENT_TEAM = V68H23597R;
 				ENABLE_PREVIEWS = NO;
 				INFOPLIST_FILE = bitchat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = bitchat;
@@ -897,6 +841,54 @@
 			};
 			name = Release;
 		};
+		B1DC0FFEE10000000000002A /* Debug configuration for PBXNativeTarget "bitchatWatchTests" */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
+			baseConfigurationReferenceRelativePath = Debug.xcconfig;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGNING_REQUIRED = YES;
+				CODE_SIGN_STYLE = "$(CODE_SIGN_STYLE)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).watchtests";
+				SDKROOT = watchos;
+				SWIFT_VERSION = "$(SWIFT_VERSION)";
+				TARGETED_DEVICE_FAMILY = 4;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/bitchat";
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Debug;
+		};
+		B1DC0FFEE10000000000002B /* Release configuration for PBXNativeTarget "bitchatWatchTests" */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
+			baseConfigurationReferenceRelativePath = Release.xcconfig;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGNING_ALLOWED = YES;
+				CODE_SIGNING_REQUIRED = YES;
+				CODE_SIGN_STYLE = "$(CODE_SIGN_STYLE)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(PRODUCT_BUNDLE_IDENTIFIER).watchtests";
+				SDKROOT = watchos;
+				SWIFT_VERSION = "$(SWIFT_VERSION)";
+				TARGETED_DEVICE_FAMILY = 4;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/bitchat.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/bitchat";
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Release;
+		};
 		B36671AEACCBF92BE10852E9 /* Release configuration for PBXNativeTarget "bitchat_iOS" */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReferenceAnchor = A6E367C92E76469E0032EA8A /* Configs */;
@@ -909,6 +901,7 @@
 				CODE_SIGN_ENTITLEMENTS = bitchat/bitchat.entitlements;
 				CODE_SIGN_STYLE = "$(CODE_SIGN_STYLE)";
 				DEVELOPMENT_ASSET_PATHS = bitchat/_PreviewHelpers;
+				DEVELOPMENT_TEAM = V68H23597R;
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_FILE = bitchat/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = bitchat;
@@ -1153,14 +1146,6 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		B1DC0FFEE10000000000002C /* Build configuration list for PBXNativeTarget "bitchatWatchTests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				B1DC0FFEE10000000000002A /* Debug configuration for PBXNativeTarget "bitchatWatchTests" */,
-				B1DC0FFEE10000000000002B /* Release configuration for PBXNativeTarget "bitchatWatchTests" */,
-			);
-			defaultConfigurationName = Debug;
-		};
 		1C27B5BA3DB46DDF0DBFEF62 /* Build configuration list for PBXNativeTarget "bitchatTests_macOS" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -1198,6 +1183,14 @@
 			buildConfigurations = (
 				B1DC0FFEE10000000000000C /* Debug configuration for PBXNativeTarget "bitchat_watchOS" */,
 				B1DC0FFEE10000000000000D /* Release configuration for PBXNativeTarget "bitchat_watchOS" */,
+			);
+			defaultConfigurationName = Debug;
+		};
+		B1DC0FFEE10000000000002C /* Build configuration list for PBXNativeTarget "bitchatWatchTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B1DC0FFEE10000000000002A /* Debug configuration for PBXNativeTarget "bitchatWatchTests" */,
+				B1DC0FFEE10000000000002B /* Release configuration for PBXNativeTarget "bitchatWatchTests" */,
 			);
 			defaultConfigurationName = Debug;
 		};

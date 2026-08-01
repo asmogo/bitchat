@@ -50,7 +50,9 @@ watch process is suspended:
   messages without requiring an app restart.
 
 Routine presence/sync traffic and discovery are disabled wrist-down; only the
-dedicated message-capable alert characteristic remains subscribed. Short Noise
+dedicated message-capable alert characteristic remains subscribed. Links to
+legacy peers without that characteristic keep their full-mesh subscription,
+because it is their only remaining wake path. Short Noise
 messages omit redundant BLE transport padding on this already-encrypted lane so
 one DM normally produces one GATT update. Peer-list
 presence expiration is paused during this interval because absent announces

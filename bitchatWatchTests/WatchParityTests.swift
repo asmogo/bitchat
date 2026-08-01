@@ -308,6 +308,16 @@ struct WatchParityTests {
         #expect(restored.lastSuccessfulAt == successfulAt)
     }
 
+    @Test("legacy links without an alert lane keep their background wake path")
+    func legacyBackgroundLanePolicy() {
+        #expect(WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
+            hasAlertLane: true
+        ))
+        #expect(!WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
+            hasAlertLane: false
+        ))
+    }
+
     @Test("background reconnect is immediate and does not expire silent peers")
     func persistentBackgroundTopology() {
         #expect(WatchMeshRuntimePolicy.reconnectDelay(
