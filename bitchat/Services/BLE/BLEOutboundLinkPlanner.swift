@@ -61,7 +61,11 @@ enum BLEOutboundLinkPlanner {
            dataCount > minLimit {
             return BLEOutboundLinkPlan(
                 directedPeerHint: directedPeerHint,
-                fragmentChunkSize: BLEOutboundPacketPolicy.fragmentChunkSize(forLinkLimit: minLimit),
+                fragmentChunkSize: BLEOutboundPacketPolicy.fragmentChunkSize(
+                    forLinkLimit: minLimit,
+                    packet: packet,
+                    hasDirectedRecipient: packet.recipientID != nil || directedOnlyPeer != nil
+                ),
                 selectedLinks: selectedLinks,
                 shouldSpoolDirectedPacket: false
             )

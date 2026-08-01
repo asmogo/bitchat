@@ -1996,38 +1996,40 @@ final class BLEService: NSObject {
         // Encode once using a small per-type padding policy, then delegate by type
         let padForBLE = BLEOutboundPacketPolicy.padsBLEFrame(for: packetToSend.type)
 
-        // The 256-fragment ceiling exists to protect *current Android*
-        // receivers, which only ever receive private media over the directed
-        // raw-file migration fallback (they do not implement the encrypted
-        // 0x20 path). Encrypted private media (`noiseEncrypted`) is sent only to
-        // peers that advertised the `.privateMedia` capability — modern clients
-        // that assemble up to the full receiver ceiling (see
-        // `BLEFragmentAssemblyBuffer`'s 10,000-fragment guard) — so forcing them
-        // down to Android's 256 cap would needlessly reject iOS→iOS photos in
-        // the ~120–512 KiB range that work today. Restrict the low cap to the
-        // migration fallback (directed `fileTransfer`); public media is
-        // unaffected. Run the same planner the scheduler will use, after route
-        // application, and reject before reserving a transfer slot or writing
-        // any fragment.
-        // TODO(#1434): negotiate an explicit per-peer fragment limit so a future
-        // Android client that adopts the encrypted 0x20 path but still caps its
-        // reassembler can advertise its own ceiling instead of relying on the
-        // capability/type proxy above.
+        // Android currently accepts encrypted private media but rejects outer
+        // fragment sets above 256. Only an exact-generation authenticated peer
+        // state proving `.extendedFragmentSets` permits a larger transfer.
+        // Announce capabilities are intentionally insufficient because they can
+        // be stale or relayed. Preflight uses the same selected-link chunk size
+        // that the scheduler receives below so admission cannot under-count.
         if let transferId,
            let recipientPeerID = PeerID(hexData: packetToSend.recipientID),
-           packetToSend.type == MessageType.fileTransfer.rawValue {
+           packetToSend.type == MessageType.fileTransfer.rawValue
+                || packetToSend.type == MessageType.noiseEncrypted.rawValue {
+            let directedOnlyPeer = packetToSend.type == MessageType.noiseEncrypted.rawValue
+                ? recipientPeerID
+                : nil
+            let selectedLinkChunk = initialFragmentChunkSize(
+                for: packetToSend,
+                pad: padForBLE,
+                directedOnlyPeer: directedOnlyPeer
+            )
             let compatibilityRequest = BLEOutboundFragmentTransferRequest(
                 packet: packetToSend,
                 pad: padForBLE,
-                maxChunk: nil,
+                maxChunk: selectedLinkChunk,
                 directedPeer: recipientPeerID,
                 transferId: transferId
             )
+            let supportsExtendedSets = packetToSend.type == MessageType.noiseEncrypted.rawValue
+                && privateMediaSessions.provenCapabilities(for: recipientPeerID)?
+                    .contains(.extendedFragmentSets) == true
             guard let plan = BLEOutboundFragmentPlanner.makePlan(
                 for: compatibilityRequest,
                 defaultChunkSize: defaultFragmentSize,
                 bleMaxMTU: bleMaxMTU
-            ), BLEOutboundFragmentPlanner.isPrivateMediaV1Compatible(plan) else {
+            ), supportsExtendedSets
+                || BLEOutboundFragmentPlanner.isPrivateMediaV1Compatible(plan) else {
                 SecureLogger.warning(
                     "Private media rejected: exceeds cross-platform 256-fragment limit",
                     category: .security
@@ -2065,10 +2067,15 @@ final class BLEService: NSObject {
         #endif
 
         if packetToSend.type == MessageType.fileTransfer.rawValue {
+            let maxChunk = initialFragmentChunkSize(
+                for: packetToSend,
+                pad: padForBLE,
+                directedOnlyPeer: nil
+            )
             sendFragmentedPacket(
                 packetToSend,
                 pad: padForBLE,
-                maxChunk: nil,
+                maxChunk: maxChunk,
                 directedOnlyPeer: nil,
                 transferId: transferId,
                 requiresPrivateMediaAdmission: requiresPrivateMediaAdmission
@@ -2081,10 +2088,15 @@ final class BLEService: NSObject {
         if packetToSend.type == MessageType.noiseEncrypted.rawValue,
            let transferId,
            let recipientPeerID = PeerID(hexData: packetToSend.recipientID) {
+            let maxChunk = initialFragmentChunkSize(
+                for: packetToSend,
+                pad: padForBLE,
+                directedOnlyPeer: recipientPeerID
+            )
             sendFragmentedPacket(
                 packetToSend,
                 pad: padForBLE,
-                maxChunk: nil,
+                maxChunk: maxChunk,
                 directedOnlyPeer: recipientPeerID,
                 transferId: transferId,
                 requiresPrivateMediaAdmission: requiresPrivateMediaAdmission
@@ -2124,13 +2136,21 @@ final class BLEService: NSObject {
 
         if let peripheralMaxLen = directPeripheralState?.peripheral.maximumWriteValueLength(for: .withoutResponse),
            data.count > peripheralMaxLen {
-            let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(forLinkLimit: peripheralMaxLen)
+            let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(
+                forLinkLimit: peripheralMaxLen,
+                packet: packet,
+                hasDirectedRecipient: true
+            )
             sendFragmentedPacket(packet, pad: pad, maxChunk: chunk, directedOnlyPeer: recipientPeerID)
             return
         }
         if let centralMaxLen = recipientCentral?.maximumUpdateValueLength,
            data.count > centralMaxLen {
-            let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(forLinkLimit: centralMaxLen)
+            let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(
+                forLinkLimit: centralMaxLen,
+                packet: packet,
+                hasDirectedRecipient: true
+            )
             sendFragmentedPacket(packet, pad: pad, maxChunk: chunk, directedOnlyPeer: recipientPeerID)
             return
         }
@@ -2254,6 +2274,110 @@ final class BLEService: NSObject {
         return bleQueue.sync(execute: accept)
     }
 
+    private func initialFragmentChunkSize(
+        for packet: BitchatPacket,
+        pad: Bool,
+        directedOnlyPeer: PeerID?
+    ) -> Int? {
+        guard let data = packet.toBinaryData(padding: pad),
+              let context = outboundLinkPlanningContext(
+                packet: packet,
+                dataCount: data.count,
+                directedOnlyPeer: directedOnlyPeer,
+                requireDirectPeerLink: false,
+                requireNoiseAuthenticatedPeerLink: false
+              ) else {
+            return nil
+        }
+        if let planned = context.plan.fragmentChunkSize {
+            return planned
+        }
+
+        // Private file packets are deliberately fragmented even when the
+        // original packet fits the selected link. Derive the physical limit
+        // anyway so preflight and the eventual forced-fragment plan use the
+        // exact same chunk size.
+        let selectedPeripheralLimits = context.connectedStates.compactMap { state -> Int? in
+            let id = state.peripheral.identifier.uuidString
+            guard context.plan.selectedLinks.peripheralIDs.contains(id) else { return nil }
+            return state.peripheral.maximumWriteValueLength(for: .withoutResponse)
+        }
+        let selectedCentralLimits = context.subscribedCentrals.compactMap { central -> Int? in
+            let id = central.identifier.uuidString
+            guard context.plan.selectedLinks.centralIDs.contains(id) else { return nil }
+            return central.maximumUpdateValueLength
+        }
+        guard let limit = BLEOutboundLinkPlanner.minimumLinkLimit(
+            peripheralWriteLimits: selectedPeripheralLimits,
+            centralNotifyLimits: selectedCentralLimits
+        ) else {
+            return nil
+        }
+        return BLEOutboundPacketPolicy.fragmentChunkSize(
+            forLinkLimit: limit,
+            packet: packet,
+            hasDirectedRecipient: packet.recipientID != nil || directedOnlyPeer != nil
+        )
+    }
+
+    private func outboundLinkPlanningContext(
+        packet: BitchatPacket,
+        dataCount: Int,
+        directedOnlyPeer: PeerID?,
+        requireDirectPeerLink: Bool,
+        requireNoiseAuthenticatedPeerLink: Bool
+    ) -> (
+        plan: BLEOutboundLinkPlan,
+        connectedStates: [BLEPeripheralLinkState],
+        subscribedCentrals: [CBCentral]
+    )? {
+        let ingressRecord = ingressLinks.record(for: packet)
+        var excludedPeerLinks = links(to: ingressRecord?.peerID)
+        if requireNoiseAuthenticatedPeerLink {
+            guard let directedOnlyPeer else { return nil }
+            let boundLinks = links(to: directedOnlyPeer)
+            let authenticatedLinks = currentNoiseAuthenticatedLinks(to: directedOnlyPeer)
+            guard !authenticatedLinks.isEmpty else { return nil }
+            excludedPeerLinks.formUnion(boundLinks.subtracting(authenticatedLinks))
+        }
+
+        let states = snapshotPeripheralStates()
+        // A link without a discovered characteristic cannot be written to
+        // (the write loop below skips it); offering it to the planner only
+        // wastes fanout slots — and a peer's single collapsed copy would be
+        // silently dropped if its bound link is still mid-rediscovery.
+        let connectedStates = states.filter { $0.isConnected && $0.characteristic != nil }
+        let centralSnapshot = snapshotSubscribedCentrals()
+        let subscribedCentrals = characteristic == nil ? [] : centralSnapshot.centrals
+        let connectedPeripheralIDs = connectedStates.map { $0.peripheral.identifier.uuidString }
+        let centralIDs = subscribedCentrals.map { $0.identifier.uuidString }
+        let peripheralPeerBindings = Dictionary(
+            uniqueKeysWithValues: connectedStates.compactMap { state -> (String, PeerID)? in
+                let uuid = state.peripheral.identifier.uuidString
+                return linkBindings.peer(forPeripheralID: uuid).map { (uuid, $0) }
+            }
+        )
+        let plan = BLEOutboundLinkPlanner.plan(
+            packet: packet,
+            dataCount: dataCount,
+            peripheralIDs: connectedPeripheralIDs,
+            peripheralWriteLimits: connectedStates.map {
+                $0.peripheral.maximumWriteValueLength(for: .withoutResponse)
+            },
+            centralIDs: centralIDs,
+            centralNotifyLimits: subscribedCentrals.map(\.maximumUpdateValueLength),
+            ingressRecord: ingressRecord,
+            excludedLinks: excludedPeerLinks,
+            peripheralPeerBindings: peripheralPeerBindings,
+            centralPeerBindings: centralSnapshot.peerIDsByCentralUUID,
+            preferredPeripheralPerPeer: linkBindings.preferredPeripheralBindings,
+            directAnnounceTTL: messageTTL,
+            directedOnlyPeer: directedOnlyPeer,
+            requireDirectPeerLink: requireDirectPeerLink || requireNoiseAuthenticatedPeerLink
+        )
+        return (plan, connectedStates, subscribedCentrals)
+    }
+
     /// Returns true only when the packet was accepted by at least one current
     /// physical link (including its link-specific backpressure queue). A
     /// process-local directed spool is deliberately not success: callers
@@ -2268,47 +2392,17 @@ final class BLEService: NSObject {
         requireNoiseAuthenticatedPeerLink: Bool = false
     ) -> Bool {
         guard !isPanicSuspended else { return false }
-        let ingressRecord = ingressLinks.record(for: packet)
-        var excludedPeerLinks = links(to: ingressRecord?.peerID)
-        if requireNoiseAuthenticatedPeerLink {
-            guard let directedOnlyPeer else { return false }
-            let boundLinks = links(to: directedOnlyPeer)
-            let authenticatedLinks = currentNoiseAuthenticatedLinks(to: directedOnlyPeer)
-            guard !authenticatedLinks.isEmpty else { return false }
-            excludedPeerLinks.formUnion(boundLinks.subtracting(authenticatedLinks))
-        }
         let outboundPriority = BLEOutboundPacketPolicy.priority(for: packet, data: data)
-
-        let states = snapshotPeripheralStates()
-        // A link without a discovered characteristic cannot be written to
-        // (the write loop below skips it); offering it to the planner only
-        // wastes fanout slots — and a peer's single collapsed copy would be
-        // silently dropped if its bound link is still mid-rediscovery.
-        let connectedStates = states.filter { $0.isConnected && $0.characteristic != nil }
-        let centralSnapshot = snapshotSubscribedCentrals()
-        let subscribedCentrals = characteristic == nil ? [] : centralSnapshot.centrals
-        let connectedPeripheralIDs = connectedStates.map { $0.peripheral.identifier.uuidString }
-        let centralIDs = subscribedCentrals.map { $0.identifier.uuidString }
-        let peripheralPeerBindings = Dictionary(uniqueKeysWithValues: connectedStates.compactMap { state -> (String, PeerID)? in
-            let uuid = state.peripheral.identifier.uuidString
-            return linkBindings.peer(forPeripheralID: uuid).map { (uuid, $0) }
-        })
-        let plan = BLEOutboundLinkPlanner.plan(
+        guard let context = outboundLinkPlanningContext(
             packet: packet,
             dataCount: data.count,
-            peripheralIDs: connectedPeripheralIDs,
-            peripheralWriteLimits: connectedStates.map { $0.peripheral.maximumWriteValueLength(for: .withoutResponse) },
-            centralIDs: centralIDs,
-            centralNotifyLimits: subscribedCentrals.map { $0.maximumUpdateValueLength },
-            ingressRecord: ingressRecord,
-            excludedLinks: excludedPeerLinks,
-            peripheralPeerBindings: peripheralPeerBindings,
-            centralPeerBindings: centralSnapshot.peerIDsByCentralUUID,
-            preferredPeripheralPerPeer: linkBindings.preferredPeripheralBindings,
-            directAnnounceTTL: messageTTL,
             directedOnlyPeer: directedOnlyPeer,
-            requireDirectPeerLink: requireDirectPeerLink || requireNoiseAuthenticatedPeerLink
-        )
+            requireDirectPeerLink: requireDirectPeerLink,
+            requireNoiseAuthenticatedPeerLink: requireNoiseAuthenticatedPeerLink
+        ) else { return false }
+        let plan = context.plan
+        let connectedStates = context.connectedStates
+        let subscribedCentrals = context.subscribedCentrals
 
         if let chunk = plan.fragmentChunkSize {
             guard !plan.selectedLinks.peripheralIDs.isEmpty || !plan.selectedLinks.centralIDs.isEmpty else {

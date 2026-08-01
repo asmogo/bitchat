@@ -29,6 +29,7 @@ struct PeerCapabilitiesTests {
 
         let high = PeerCapabilities(rawValue: 1 << 11)
         #expect(high.encoded() == Data([0x00, 0x08]))
+        #expect(high == .extendedFragmentSets)
 
         let all: PeerCapabilities = [
             .prekeys,
@@ -40,7 +41,8 @@ struct PeerCapabilitiesTests {
             .meshDiagnostics,
             .privateMedia,
             .privateMediaReceipts,
-            .nonDestructiveNoiseReplacement
+            .nonDestructiveNoiseReplacement,
+            .extendedFragmentSets
         ]
         #expect(PeerCapabilities(encoded: all.encoded()) == all)
         #expect(PeerCapabilities(encoded: high.encoded()) == high)

@@ -199,6 +199,14 @@ class NoiseSession {
             return remoteStaticPublicKey
         }
     }
+
+    /// Channel-binding token for the established transport generation. A new
+    /// Noise handshake produces a new hash even when the remote static key is
+    /// unchanged, allowing application capability proofs to be scoped to the
+    /// exact session that decrypted them.
+    func getHandshakeHash() -> Data? {
+        sessionQueue.sync { handshakeHash }
+    }
     
     func reset() {
         sessionQueue.sync(flags: .barrier) {

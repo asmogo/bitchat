@@ -40,6 +40,12 @@ public struct PeerCapabilities: OptionSet, Equatable, Hashable, Sendable {
     /// this bit; keep it decodable so the wire assignment is never reused.
     public static let nonDestructiveNoiseReplacement =
         PeerCapabilities(rawValue: 1 << 10)
+    /// The receiver can assemble private-media fragment sets above the
+    /// deployed cross-platform v1 ceiling of 256 fragments. Senders must only
+    /// act on this bit after it is proved inside the current authenticated
+    /// Noise generation; an announce alone is not sufficient.
+    public static let extendedFragmentSets =
+        PeerCapabilities(rawValue: 1 << 11)
 
     /// Minimal little-endian byte encoding; always at least one byte so an
     /// empty set is distinguishable from an absent TLV.

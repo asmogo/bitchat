@@ -360,4 +360,17 @@ extension BLEPrivateMediaSessionStore {
         }
         return generation
     }
+
+    /// Capabilities proved by authenticated peer state in the exact current
+    /// Noise generation. Announced or stale-generation capabilities are never
+    /// returned here.
+    func provenCapabilities(for peerID: PeerID) -> PeerCapabilities? {
+        let inputs = policyInputs(for: peerID)
+        guard let generation = inputs.sessionGeneration,
+              let authenticated = inputs.authenticatedState,
+              authenticated.sessionGeneration == generation else {
+            return nil
+        }
+        return authenticated.capabilities
+    }
 }

@@ -2,7 +2,7 @@ import BitFoundation
 import Foundation
 
 enum BLEOutboundPacketPolicy {
-    private static let fragmentFrameOverhead = 13 + 8 + 8 + 13
+    private static let fragmentPayloadHeaderSize = 13
 
     static func messageID(for packet: BitchatPacket) -> String {
         BLEIngressLinkRegistry.messageID(for: packet)
@@ -47,8 +47,30 @@ enum BLEOutboundPacketPolicy {
         }
     }
 
-    static func fragmentChunkSize(forLinkLimit limit: Int) -> Int {
-        max(64, limit - fragmentFrameOverhead)
+    /// Returns a fragment payload size that keeps the encoded outer fragment
+    /// within the selected BLE link's limit. Account for routed v2 frames and
+    /// the compression original-length field as well as the fixed envelope;
+    /// otherwise a routed transfer can still exceed a watch-sized link after
+    /// being "adapted" to it.
+    static func fragmentChunkSize(
+        forLinkLimit limit: Int,
+        packet: BitchatPacket? = nil,
+        hasDirectedRecipient: Bool = true
+    ) -> Int {
+        let route = packet?.route ?? []
+        let version: UInt8 = route.isEmpty ? 1 : 2
+        let headerSize = BinaryProtocol.headerSize(for: version)
+            ?? BinaryProtocol.v1HeaderSize
+        let recipientSize = hasDirectedRecipient ? BinaryProtocol.recipientIDSize : 0
+        let routeSize = route.isEmpty ? 0 : 1 + route.count * BinaryProtocol.senderIDSize
+        let compressionLengthReserve = version == 2 ? 4 : 2
+        let overhead = headerSize
+            + BinaryProtocol.senderIDSize
+            + recipientSize
+            + routeSize
+            + fragmentPayloadHeaderSize
+            + compressionLengthReserve
+        return max(1, limit - overhead)
     }
 
     private static func fragmentTotalCount(from payload: Data) -> Int {

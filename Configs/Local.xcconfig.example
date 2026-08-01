@@ -6,3 +6,7 @@ PRODUCT_BUNDLE_IDENTIFIER = chat.bitchat.$(DEVELOPMENT_TEAM)
 
 // App and share extension must use an App Group registered to your team.
 APP_GROUP_ID = group.chat.bitchat.$(DEVELOPMENT_TEAM)
+
+// The iOS app's bundle id again, verbatim — used by the bitchat watch app to
+// find its companion. Keep in sync with PRODUCT_BUNDLE_IDENTIFIER above.
+WATCH_COMPANION_BUNDLE_ID = chat.bitchat.$(DEVELOPMENT_TEAM)
