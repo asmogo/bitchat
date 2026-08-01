@@ -1696,6 +1696,13 @@ final class WatchBLEController: NSObject, ObservableObject {
                   ) else { return false }
             return true
 
+        case .announceV2:
+            // The rotation-preserving presence format is not consumed by the
+            // shipping mesh yet. Admit only a well-formed, current packet so
+            // it can relay through the watch without populating local peers.
+            return !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp)
+                && AnnounceV2Packet.decode(from: packet.payload) != nil
+
         case .message:
             guard !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp),
                   packet.payload.count <= Self.maxPublicContentBytes,
@@ -1770,6 +1777,10 @@ final class WatchBLEController: NSObject, ObservableObject {
         switch type {
         case .announce:
             handleAnnounce(packet, from: senderPeer, linkUUID: linkUUID)
+        case .announceV2:
+            // Match the phone: the format is defined, but consuming rotating
+            // peer presence awaits the identity-binding policy.
+            break
         case .message:
             handlePublicMessage(packet, from: senderPeer)
         case .leave:

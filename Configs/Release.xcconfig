@@ -15,3 +15,7 @@ APP_GROUP_ID = group.chat.bitchat
 // NOTE: must be overridden in Local.xcconfig alongside PRODUCT_BUNDLE_IDENTIFIER,
 // because target-level bundle-ID suffixes would otherwise leak into this value.
 WATCH_COMPANION_BUNDLE_ID = chat.bitchat
+
+// Apply developer-specific signing and bundle identifiers to both Debug and
+// Release builds. Debug inherits this configuration.
+#include? "Local.xcconfig"

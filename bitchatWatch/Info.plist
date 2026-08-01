@@ -32,6 +32,8 @@
 	</array>
 	<key>WKCompanionAppBundleIdentifier</key>
 	<string>$(WATCH_COMPANION_BUNDLE_ID)</string>
+	<key>WKRunsIndependentlyOfCompanionApp</key>
+	<true/>
 	<key>WKApplication</key>
 	<true/>
 </dict>
