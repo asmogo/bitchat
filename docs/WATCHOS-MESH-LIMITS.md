@@ -37,8 +37,12 @@ per app. The eight-link foreground mesh is restored as soon as the scene becomes
 active. A Bluetooth alert wake performs a narrowly scoped recovery pass that:
 
 - adopts system-connected peripherals and resumes known connections;
-- temporarily reopens the normal mesh characteristic and requests sync only
-  after Core Bluetooth confirms that subscription;
+- temporarily reopens the normal mesh characteristic so spooled directed
+  packets flush and live traffic flows for the drain window;
+- never issues gossip-sync or fragment-resync requests wrist-down: their
+  response bursts spend the same five-opportunity budget as message wakes,
+  so sync stays a foreground activity and catch-up runs on the next granted
+  foreground runtime;
 - uses a single compact wake signal for a message that cannot fit one alert
   update, rather than spending an opportunity on every fragment;
 - persists conversation state.

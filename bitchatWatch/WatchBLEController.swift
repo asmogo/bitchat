@@ -705,9 +705,10 @@ final class WatchBLEController: NSObject, ObservableObject {
     /// message arrives.
     ///
     /// Temporarily reopen the full-mesh lane during the granted runtime. The
-    /// alert characteristic is a one-packet wake path; missed public packets
-    /// and deferred directed packets drain on the normal characteristic without
-    /// requiring another background opportunity.
+    /// alert characteristic is a one-packet wake path; deferred directed
+    /// packets the peer spooled flush on resubscription, and live traffic
+    /// flows for the drain window — without spending further budget on
+    /// gossip-sync request bursts, which stay foreground-only.
     func handleBluetoothBackgroundWake() async {
         let alertTicket = bluetoothAlertGate.arm()
         await MainActor.run {
@@ -2381,6 +2382,13 @@ final class WatchBLEController: NSObject, ObservableObject {
         on linkUUID: UUID? = nil,
         force: Bool = false
     ) {
+        // Gossip sync is a foreground activity. Every request triggers a
+        // response burst, and wrist-down each burst packet spends the same
+        // scarce background-notification budget that message wakes depend
+        // on. Directed traffic the peer spooled flushes on resubscription
+        // without a request, and public catch-up happens on foreground
+        // return via performGrantedRuntimeMaintenance.
+        guard isAppInForeground else { return }
         let now = Date()
         if let linkUUID {
             guard force || now.timeIntervalSince(lastPublicSyncByLink[linkUUID] ?? .distantPast) >= 15 else {
@@ -2824,6 +2832,9 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     private func requestStalledFragments() {
+        // Same budget rule as gossip sync: resync requests invite bursts,
+        // so fragment recovery waits for granted foreground runtime.
+        guard isAppInForeground else { return }
         let ids = fragmentAssembler.stalledBroadcastFragmentIDs(
             stalledAfter: 5,
             retryAfter: 10,
