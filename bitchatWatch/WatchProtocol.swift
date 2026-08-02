@@ -654,28 +654,28 @@ final class WatchFragmentAssembler {
             return .rejected(reason: "inconsistent fragment metadata")
         }
 
-        if let existing = buffer.parts[header.index], existing != header.data {
-            removeBuffer(for: key)
-            return .rejected(reason: "conflicting duplicate fragment")
-        }
+        // Mirror the iOS assembler: relayed duplicates and retransmitted
+        // trains bypass packet deduplication, so a conflicting index
+        // overwrites instead of destroying the whole in-flight stream.
+        let replacedBytes = buffer.parts[header.index]?.count ?? 0
         let madeProgress = buffer.parts[header.index] == nil
-        let byteDelta = madeProgress ? header.data.count : 0
+        let grownBytes = header.data.count - replacedBytes
         let assemblyLimit = Self.assemblyLimit(for: header.originalType)
-        guard buffer.byteCount <= assemblyLimit - byteDelta else {
+        guard buffer.byteCount + grownBytes <= assemblyLimit else {
             removeBuffer(for: key)
             return .rejected(reason: "assembled payload exceeds \(assemblyLimit)B")
         }
-        while totalBufferedBytes > maxBufferedBytes - byteDelta,
+        while totalBufferedBytes + grownBytes > maxBufferedBytes,
               evictOldest(excluding: key) {}
-        guard totalBufferedBytes <= maxBufferedBytes - byteDelta else {
+        guard totalBufferedBytes + grownBytes <= maxBufferedBytes else {
             removeBuffer(for: key)
             return .rejected(reason: "fragment buffer memory limit")
         }
 
         buffer.parts[header.index] = header.data
+        buffer.byteCount += grownBytes
+        totalBufferedBytes += grownBytes
         if madeProgress {
-            buffer.byteCount += byteDelta
-            totalBufferedBytes += byteDelta
             buffer.lastNewPartAt = Date()
         }
         buffers[key] = buffer

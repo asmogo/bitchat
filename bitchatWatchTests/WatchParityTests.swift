@@ -318,6 +318,89 @@ struct WatchParityTests {
         ))
     }
 
+    @Test("unreachable candidates cool down instead of starving connection slots")
+    func connectionFailureBackoff() {
+        #expect(WatchMeshRuntimePolicy.connectionRetryCooldown(
+            consecutiveFailures: 0
+        ) == 0)
+        #expect(WatchMeshRuntimePolicy.connectionRetryCooldown(
+            consecutiveFailures: 1
+        ) == 0)
+        #expect(WatchMeshRuntimePolicy.connectionRetryCooldown(
+            consecutiveFailures: 2
+        ) == 30)
+        #expect(WatchMeshRuntimePolicy.connectionRetryCooldown(
+            consecutiveFailures: 3
+        ) == 60)
+        #expect(WatchMeshRuntimePolicy.connectionRetryCooldown(
+            consecutiveFailures: 20
+        ) == 600)
+        #expect(WatchMeshRuntimePolicy.minimumCandidateRSSI == -90)
+    }
+
+    @Test("conflicting duplicate fragments overwrite instead of destroying the stream")
+    func fragmentAssemblerDuplicateOverwrite() throws {
+        func fragmentPacket(index: Int, total: Int, chunk: Data) -> BitchatPacket {
+            var payload = Data(repeating: 0x2A, count: 8)
+            var bigIndex = UInt16(index).bigEndian
+            var bigTotal = UInt16(total).bigEndian
+            withUnsafeBytes(of: &bigIndex) { payload.append(contentsOf: $0) }
+            withUnsafeBytes(of: &bigTotal) { payload.append(contentsOf: $0) }
+            payload.append(MessageType.fileTransfer.rawValue)
+            payload.append(chunk)
+            return BitchatPacket(
+                type: MessageType.fragment.rawValue,
+                senderID: Data(repeating: 1, count: 8),
+                recipientID: nil,
+                timestamp: 1,
+                payload: payload,
+                signature: nil,
+                ttl: 7
+            )
+        }
+
+        let assembler = WatchFragmentAssembler()
+        _ = assembler.append(try #require(
+            WatchFragmentHeader(packet: fragmentPacket(index: 0, total: 2, chunk: Data([1, 2, 3])))
+        ))
+        _ = assembler.append(try #require(
+            WatchFragmentHeader(packet: fragmentPacket(index: 0, total: 2, chunk: Data([4, 5])))
+        ))
+        let result = assembler.append(try #require(
+            WatchFragmentHeader(packet: fragmentPacket(index: 1, total: 2, chunk: Data([6])))
+        ))
+
+        guard case let .complete(data) = result else {
+            Issue.record("expected completion after duplicate overwrite")
+            return
+        }
+        #expect(data == Data([4, 5, 6]))
+    }
+
+    @Test("peripheral history backs off failures and resets on success")
+    func peripheralHistoryFailureTracking() throws {
+        let suite = "watch-peripheral-failure-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let peripheralID = UUID()
+        let store = WatchPeripheralHistoryStore(defaults: defaults, storageKey: "history")
+        let failedAt = Date()
+
+        store.recordFailure(peripheralID, at: failedAt)
+        store.recordFailure(peripheralID, at: failedAt)
+        var snapshot = WatchPeripheralHistoryStore(
+            defaults: defaults,
+            storageKey: "history"
+        ).snapshot(for: peripheralID)
+        #expect(snapshot.consecutiveFailures == 2)
+        #expect(snapshot.lastFailureAt == failedAt)
+
+        store.recordSuccess(peripheralID, at: failedAt.addingTimeInterval(30))
+        snapshot = store.snapshot(for: peripheralID)
+        #expect(snapshot.consecutiveFailures == 0)
+        #expect(snapshot.lastFailureAt == nil)
+    }
+
     @Test("background reconnect is immediate and does not expire silent peers")
     func persistentBackgroundTopology() {
         #expect(WatchMeshRuntimePolicy.reconnectDelay(
@@ -456,9 +539,10 @@ struct WatchParityTests {
         ))
     }
 
-    @Test("peer-state timeout never enables private media")
-    func peerStateTimeoutBlocksMedia() {
-        let coordinator = WatchPeerSecurityCoordinator(store: MemoryPeerStateStore())
+    @Test("peer-state timeout falls back to legacy media unless pinned")
+    func peerStateTimeoutMediaPolicy() {
+        let store = MemoryPeerStateStore()
+        let coordinator = WatchPeerSecurityCoordinator(store: store)
         let remoteStatic = Data(repeating: 8, count: 32)
         let peerID = PeerID(publicKey: remoteStatic)
         let session = WatchAuthenticatedNoiseSession(
@@ -468,10 +552,46 @@ struct WatchParityTests {
         let nonce = coordinator.begin(peerID: peerID, session: session)
         #expect(nonce != nil)
         #expect(coordinator.expire(peerID: peerID, session: session, nonce: nonce!))
+
+        // A peer that never proved media capability (current Android) gets
+        // iOS's signed legacy directed fallback instead of a permanent block.
+        #expect(coordinator.sendPolicy(
+            peerID: peerID,
+            authenticatedSession: session
+        ) == .legacyFallback)
+
+        // Once the peer did prove private media, the sticky pin makes a later
+        // timeout a downgrade attempt: stay blocked, never fall back to clear.
+        store.pins.insert(WatchPeerSecurityCoordinator.fingerprint(remoteStatic))
         #expect(coordinator.sendPolicy(
             peerID: peerID,
             authenticatedSession: session
         ) == .blocked)
+    }
+
+    @Test("proven peer without media capability falls back unless pinned")
+    func provenNoMediaPolicy() {
+        let store = MemoryPeerStateStore()
+        let coordinator = WatchPeerSecurityCoordinator(store: store)
+        let remoteStatic = Data(repeating: 3, count: 32)
+        let peerID = PeerID(publicKey: remoteStatic)
+        let session = WatchAuthenticatedNoiseSession(
+            remoteStaticKey: remoteStatic,
+            sessionToken: Data(repeating: 11, count: 32)
+        )
+        _ = coordinator.begin(peerID: peerID, session: session)
+        #expect(coordinator.receive(
+            peerID: peerID,
+            state: WatchAuthenticatedPeerStatePacket(
+                capabilities: [],
+                signingPublicKey: Data(repeating: 6, count: 32)
+            ),
+            decryptedSession: session
+        ).accepted)
+        #expect(coordinator.sendPolicy(
+            peerID: peerID,
+            authenticatedSession: session
+        ) == .legacyFallback)
     }
 
     @Test("GCS request omits packets the requester already has")

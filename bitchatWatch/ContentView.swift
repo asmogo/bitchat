@@ -82,10 +82,10 @@ struct ContentView: View {
         .background(Color.black.ignoresSafeArea())
         .onAppear {
             ble.start()
-            ble.setAppInForeground(scenePhase == .active)
+            ble.setAppInForeground(scenePhase != .background)
         }
         .onChange(of: scenePhase) { _, phase in
-            ble.setAppInForeground(phase == .active)
+            ble.setAppInForeground(phase != .background)
         }
     }
 }
@@ -1202,6 +1202,21 @@ private func formatBytes(_ bytes: Int) -> String {
 private struct DiagnosticsView: View {
     @ObservedObject var ble: WatchBLEController
 
+    private func logColor(for line: String) -> Color {
+        if line.contains("fail") || line.contains("error")
+            || line.contains("reject") || line.contains("timeout")
+            || line.contains("exhausted") || line.contains("unavailable") {
+            return .red
+        }
+        if line.contains("✓") || line.contains("peer +") || line.contains("ready") {
+            return WatchPalette.green
+        }
+        if line.contains("quiet") || line.contains("parked") || line.contains("peer -") {
+            return WatchPalette.orange
+        }
+        return .white
+    }
+
     var body: some View {
         VStack(spacing: 4) {
             HStack(spacing: 4) {
@@ -1230,27 +1245,33 @@ private struct DiagnosticsView: View {
             Text(
                 "stage \(ble.connectionStageSummary)"
                     + " · recover \(ble.recoveryCount)/\(ble.phaseTimeoutCount)"
+                    + (ble.lastRecoveryReason != "none" ? " · last \(ble.lastRecoveryReason)" : "")
             )
                 .font(.bitchat(8, weight: .medium))
                 .foregroundStyle(WatchPalette.tertiary)
-            if ble.lastRecoveryReason != "none" {
-                Text("last \(ble.lastRecoveryReason)")
-                    .font(.bitchat(8, weight: .medium))
-                    .foregroundStyle(WatchPalette.tertiary)
-            }
             Text("rx \(ble.rxBytes) · tx \(ble.txBytes)")
                 .font(.bitchat(8, weight: .medium))
                 .foregroundStyle(WatchPalette.tertiary)
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
+                    LazyVStack(alignment: .leading, spacing: 1) {
                         ForEach(Array(ble.logLines.enumerated()), id: \.offset) { index, line in
                             Text(line)
-                                .font(.bitchat(7))
+                                .font(.bitchat(9))
+                                .foregroundStyle(logColor(for: line))
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .id(index)
                         }
+                    }
+                    .padding(4)
+                }
+                .background(WatchPalette.surface, in: RoundedRectangle(cornerRadius: 8))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+                .onAppear {
+                    if let last = ble.logLines.indices.last {
+                        proxy.scrollTo(last, anchor: .bottom)
                     }
                 }
                 .onChange(of: ble.logLines.count) { _, _ in

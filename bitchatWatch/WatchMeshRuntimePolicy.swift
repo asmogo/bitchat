@@ -21,6 +21,20 @@ enum WatchMeshRuntimePolicy {
     static let candidateCollectionInterval: TimeInterval = 1
     static let candidateRetentionInterval: TimeInterval = 30
     static let connectionAttemptTimeout: TimeInterval = 30
+    /// Freshly discovered peripherals weaker than this are not worth a
+    /// connection slot: at that range attempts time out for hours without
+    /// ever completing (observed -90...-95 dBm perpetual failures).
+    static let minimumCandidateRSSI = -90
+
+    /// Per-peripheral cooldown after consecutive connection failures. Without
+    /// it, a handful of unreachable advertisers permanently occupy all
+    /// concurrent connection slots and starve healthy links — including the
+    /// foreground-resume path, which then appears to "find no peers".
+    static func connectionRetryCooldown(consecutiveFailures: Int) -> TimeInterval {
+        guard consecutiveFailures >= 2 else { return 0 }
+        let exponent = min(consecutiveFailures - 1, 6)
+        return min(600, TimeInterval(15 * (1 << exponent)))
+    }
     static let serviceDiscoveryTimeout: TimeInterval = 15
     static let characteristicDiscoveryTimeout: TimeInterval = 15
     static let notificationSubscriptionTimeout: TimeInterval = 15

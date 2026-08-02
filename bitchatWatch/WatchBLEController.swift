@@ -407,6 +407,7 @@ final class WatchBLEController: NSObject, ObservableObject {
         guard foreground != isAppInForeground else {
             if foreground {
                 adoptSystemConnectedPeripherals()
+                expireStalledConnectionPhases(now: Date())
                 resumeKnownPeripherals()
                 reconcileDiscoveryState()
                 performGrantedRuntimeMaintenance(force: true)
@@ -430,6 +431,10 @@ final class WatchBLEController: NSObject, ObservableObject {
             backgroundDrainActive = false
             setFullMeshNotifications(enabled: true)
             adoptSystemConnectedPeripherals()
+            // System-owned background connect requests can leave their slots
+            // occupied long after the UI returns; free the stalled ones now
+            // instead of waiting for the next watchdog pass.
+            expireStalledConnectionPhases(now: Date())
             resumeKnownPeripherals()
             reconcileDiscoveryState()
             performGrantedRuntimeMaintenance(force: true)
@@ -452,6 +457,7 @@ final class WatchBLEController: NSObject, ObservableObject {
 
     private func setFullMeshNotifications(enabled: Bool) {
         var legacyLanesKept = 0
+        var changedLanes = 0
         for (uuid, characteristic) in writableCharacteristics {
             guard let peripheral = peripherals[uuid],
                   peripheral.state == .connected,
@@ -467,7 +473,9 @@ final class WatchBLEController: NSObject, ObservableObject {
                 meshUnsubscribeInFlight[uuid, default: 0] += 1
             }
             peripheral.setNotifyValue(enabled, for: characteristic)
+            changedLanes += 1
         }
+        guard changedLanes > 0 else { return }
         if enabled {
             log("foreground mesh subscriptions enabled")
         } else {
@@ -486,6 +494,9 @@ final class WatchBLEController: NSObject, ObservableObject {
     /// foreground eight-link mesh resumes.
     private func enforceBackgroundConnectionBudget() {
         guard running, !isAppInForeground, let centralManager else { return }
+        // A parked link kills every fragment train flowing across it; defer
+        // the budget until in-flight assemblies complete or expire.
+        guard !fragmentAssembler.hasActiveAssemblies else { return }
         let candidates = peripherals.values.compactMap { peripheral -> WatchBackgroundRelayCandidate? in
             guard peripheral.state == .connected else { return nil }
             let id = peripheral.identifier
@@ -579,6 +590,7 @@ final class WatchBLEController: NSObject, ObservableObject {
             consecutivePhaseTimeouts += 1
             connectionPhases.removeValue(forKey: id)
             connectionRequestedAt.removeValue(forKey: id)
+            peripheralHistory.recordFailure(id, at: now)
             phaseTimeoutCount += 1
             lastRecoveryReason = "\(state.phase.rawValue) timeout"
             log("\(state.phase.rawValue) timeout \(id.uuidString.prefix(8))")
@@ -613,6 +625,14 @@ final class WatchBLEController: NSObject, ObservableObject {
                   self.isAppInForeground,
                   self.peripherals[id] === peripheral,
                   peripheral.state != .disconnected else { return }
+            // A wedged peripheral only justifies a full central rebuild when
+            // no healthy link remains; otherwise the collateral damage is
+            // worse than the stuck candidate, which failure backoff already
+            // starves.
+            guard self.announcedReadyLinks.isEmpty else {
+                self.log("keeping \(self.announcedReadyLinks.count) ready link(s); not rebuilding for wedged \(phase.rawValue)")
+                return
+            }
             self.rebuildCentralManager(
                 reason: "uncancelled \(phase.rawValue) timeout"
             )
@@ -694,8 +714,10 @@ final class WatchBLEController: NSObject, ObservableObject {
             // A bluetoothAlert task can be delivered while the UI is active.
             // Downgrading real foreground state would silence the announce
             // heartbeat, the transport watchdog, and presence expiry while
-            // the user is looking at the app.
-            if WKApplication.shared().applicationState != .active {
+            // the user is looking at the app. The Always-On blur state is
+            // foreground for the same reason: tearing down on every wrist
+            // flick reconfigures every link several times per second.
+            if WKApplication.shared().applicationState == .background {
                 isAppInForeground = false
                 liveVoiceCoordinator.setAppInForeground(false)
             }
@@ -1732,12 +1754,57 @@ final class WatchBLEController: NSObject, ObservableObject {
             }
             initiateNoiseHandshake(with: peerID)
 
+        case .legacyFallback:
+            sendSignedLegacyPrivateFile(item.data, messageID: item.messageID, to: peerID)
+
         case .blocked:
             if let messageID = item.messageID {
                 updatePrivateStatus(messageID, peerID: peerID, status: "failed")
             }
-            log("private media blocked without authenticated capability proof")
+            log("private media blocked after a proven capability downgrade")
         }
+    }
+
+    /// Compatibility-only fallback for peers that have not advertised
+    /// encrypted private media — mirrors iOS sendSignedLegacyPrivateFile.
+    /// The payload is authenticated but visible to relays.
+    private func sendSignedLegacyPrivateFile(
+        _ typedPayload: Data,
+        messageID: String?,
+        to peerID: PeerID
+    ) {
+        guard typedPayload.first == WatchNoisePayloadType.privateFile.rawValue,
+              let recipientData = peerID.routingData else {
+            if let messageID {
+                updatePrivateStatus(messageID, peerID: peerID, status: "failed")
+            }
+            return
+        }
+        let unsigned = BitchatPacket(
+            type: MessageType.fileTransfer.rawValue,
+            senderID: identity.peerIDData,
+            recipientID: recipientData,
+            timestamp: WatchPacketFactory.nowMilliseconds(),
+            payload: Data(typedPayload.dropFirst()),
+            signature: nil,
+            ttl: WatchPacketFactory.messageTTL,
+            version: 2
+        )
+        guard let signed = WatchPacketFactory.sign(unsigned, with: identity) else {
+            if let messageID {
+                updatePrivateStatus(messageID, peerID: peerID, status: "failed")
+            }
+            return
+        }
+        let sent = broadcast(signed)
+        if let messageID {
+            updatePrivateStatus(
+                messageID,
+                peerID: peerID,
+                status: sent > 0 ? "sent" : "waiting for peers"
+            )
+        }
+        log("tx legacy DM media \(signed.payload.count)B → \(peerID.id.prefix(8))")
     }
 
     private func queuePendingPrivateMediaPayload(
@@ -1795,6 +1862,15 @@ final class WatchBLEController: NSObject, ObservableObject {
                 if let messageID = item.messageID {
                     updatePrivateStatus(messageID, peerID: peerID, status: "failed")
                 }
+            }
+        case .legacyFallback:
+            let pending = pendingPrivateMediaPayloads.removeValue(forKey: peerID) ?? []
+            for item in pending {
+                sendSignedLegacyPrivateFile(
+                    item.data,
+                    messageID: item.messageID,
+                    to: peerID
+                )
             }
         case .needsHandshake:
             initiateNoiseHandshake(with: peerID)
@@ -2096,9 +2172,15 @@ final class WatchBLEController: NSObject, ObservableObject {
             return
         }
         let senderPeer = PeerID(hexData: packet.senderID)
-        guard senderPeer != identity.peerID,
-              isValidForRelayOrDelivery(packet, from: senderPeer) else {
-            log("rx rejected before relay")
+        guard senderPeer != identity.peerID else {
+            log("rx rejected 0x\(String(packet.type, radix: 16)): self echo")
+            return
+        }
+        if let reason = admissionFailure(for: packet, from: senderPeer) {
+            log(
+                "rx rejected 0x\(String(packet.type, radix: 16)) "
+                    + "\(senderPeer.id.prefix(8)): \(reason)"
+            )
             return
         }
 
@@ -2111,67 +2193,96 @@ final class WatchBLEController: NSObject, ObservableObject {
         }
     }
 
-    private func isValidForRelayOrDelivery(
-        _ packet: BitchatPacket,
+    /// Returns nil when the packet may be relayed or delivered, otherwise a
+    /// short human-readable rejection reason for the mesh log.
+    private func admissionFailure(
+        for packet: BitchatPacket,
         from senderPeer: PeerID
-    ) -> Bool {
-        guard let type = MessageType(rawValue: packet.type) else { return false }
+    ) -> String? {
+        guard let type = MessageType(rawValue: packet.type) else { return "unknown type" }
         switch type {
         case .announce:
-            guard let announcement = WatchAnnouncementPacket.decode(from: packet.payload),
-                  PeerID(publicKey: announcement.noisePublicKey) == senderPeer,
-                  !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp),
-                  WatchPacketFactory.verify(
-                    packet,
-                    signingPublicKey: announcement.signingPublicKey
-                  ) else { return false }
-            return true
+            guard let announcement = WatchAnnouncementPacket.decode(from: packet.payload) else {
+                return "malformed announce"
+            }
+            guard PeerID(publicKey: announcement.noisePublicKey) == senderPeer else {
+                return "announce identity mismatch"
+            }
+            guard !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp) else {
+                return "stale announce"
+            }
+            guard WatchPacketFactory.verify(
+                packet,
+                signingPublicKey: announcement.signingPublicKey
+            ) else { return "bad announce signature" }
+            return nil
 
         case .announceV2:
             // The rotation-preserving presence format is not consumed by the
             // shipping mesh yet. Admit only a well-formed, current packet so
             // it can relay through the watch without populating local peers.
-            return !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp)
-                && AnnounceV2Packet.decode(from: packet.payload) != nil
+            if WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp) {
+                return "stale announceV2"
+            }
+            return AnnounceV2Packet.decode(from: packet.payload) != nil
+                ? nil : "malformed announceV2"
 
         case .message:
-            guard !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp),
-                  packet.payload.count <= Self.maxPublicContentBytes,
-                  let content = String(data: packet.payload, encoding: .utf8),
-                  !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return false
+            guard !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp) else {
+                return "stale message"
             }
-            return verifyKnownPublicPacket(packet, from: senderPeer)
+            guard packet.payload.count <= Self.maxPublicContentBytes else {
+                return "oversized message"
+            }
+            guard let content = String(data: packet.payload, encoding: .utf8),
+                  !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return "empty message"
+            }
+            return publicPacketFailure(packet, from: senderPeer)
 
         case .fileTransfer, .leave:
-            return !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp)
-                && verifyKnownPublicPacket(packet, from: senderPeer)
+            if WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp) {
+                return type == .fileTransfer ? "stale file" : "stale leave"
+            }
+            return publicPacketFailure(packet, from: senderPeer)
 
         case .voiceFrame:
-            return packet.payload.count <= TransportConfig.pttMaxBurstContentBytes
-                && verifyKnownPublicPacket(packet, from: senderPeer)
+            guard packet.payload.count <= TransportConfig.pttMaxBurstContentBytes else {
+                return "oversized voice frame"
+            }
+            return publicPacketFailure(packet, from: senderPeer)
 
         case .requestSync:
-            return packet.ttl == 0
-                && !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp)
-                && verifyKnownPublicPacket(packet, from: senderPeer)
+            guard packet.ttl == 0 else { return "routed sync request" }
+            guard !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp) else {
+                return "stale sync request"
+            }
+            return publicPacketFailure(packet, from: senderPeer)
 
         case .fragment:
-            return !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp)
-                && WatchFragmentHeader(packet: packet) != nil
+            if WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp) {
+                return "stale fragment"
+            }
+            return WatchFragmentHeader(packet: packet) != nil
+                ? nil : "malformed fragment header"
 
         case .noiseHandshake, .noiseEncrypted:
-            return !packet.payload.isEmpty
-                && packet.recipientID != nil
-                && packet.recipientID != WatchPacketFactory.broadcastRecipient
-                && !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp)
+            guard !packet.payload.isEmpty else { return "empty noise payload" }
+            guard packet.recipientID != nil else { return "undirected noise" }
+            guard packet.recipientID != WatchPacketFactory.broadcastRecipient else {
+                return "broadcast noise"
+            }
+            guard !WatchPacketFactory.isStale(timestampMilliseconds: packet.timestamp) else {
+                return "stale noise"
+            }
+            return nil
 
         case .ping, .pong, .boardPost, .prekeyBundle, .groupMessage,
              .courierEnvelope, .nostrCarrier:
             // Match Android's relay admission for packet families whose own
             // handlers provide their authentication. The watch does not mutate
             // local state for these types.
-            return !packet.payload.isEmpty
+            return packet.payload.isEmpty ? "empty payload" : nil
         }
     }
 
@@ -2191,15 +2302,15 @@ final class WatchBLEController: NSObject, ObservableObject {
         )
     }
 
-    private func verifyKnownPublicPacket(
+    private func publicPacketFailure(
         _ packet: BitchatPacket,
         from senderPeer: PeerID
-    ) -> Bool {
-        guard let knownPeer = peer(senderPeer) else { return false }
+    ) -> String? {
+        guard let knownPeer = peer(senderPeer) else { return "unknown peer" }
         return WatchPacketFactory.verify(
             packet,
             signingPublicKey: knownPeer.signingPublicKey
-        )
+        ) ? nil : "bad signature"
     }
 
     private func process(_ packet: BitchatPacket, from senderPeer: PeerID, linkUUID: UUID) {
@@ -2488,7 +2599,10 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     private func handleFileTransfer(_ packet: BitchatPacket, from senderPeer: PeerID) {
-        guard packet.recipientID == nil || packet.recipientID == WatchPacketFactory.broadcastRecipient else {
+        let directedToUs = packet.recipientID == identity.peerIDData
+        guard packet.recipientID == nil
+                || packet.recipientID == WatchPacketFactory.broadcastRecipient
+                || directedToUs else {
             log("file reject: recipient mismatch")
             return
         }
@@ -2500,12 +2614,14 @@ final class WatchBLEController: NSObject, ObservableObject {
             log("file reject: bad signature from \(senderPeer.id.prefix(8))")
             return
         }
-        gossipStore.record(packet)
+        // Directed legacy private transfers are point-to-point, not gossip.
+        if !directedToUs { gossipStore.record(packet) }
         handleFilePayload(
             packet.payload,
             from: senderPeer,
             timestamp: Date(timeIntervalSince1970: Double(packet.timestamp) / 1000),
-            isPrivate: false
+            isPrivate: directedToUs,
+            usesDurableReceipts: false
         )
     }
 
@@ -2513,14 +2629,15 @@ final class WatchBLEController: NSObject, ObservableObject {
         _ payload: Data,
         from peerID: PeerID,
         timestamp: Date,
-        isPrivate: Bool
+        isPrivate: Bool,
+        usesDurableReceipts: Bool = true
     ) {
         guard let packet = WatchFilePacket.decode(payload) else {
             log("file reject: malformed payload (\(payload.count)B)")
             return
         }
         let wireName = ((packet.fileName ?? "file") as NSString).lastPathComponent
-        let stableMessageID = isPrivate
+        let stableMessageID = isPrivate && usesDurableReceipts
             ? PrivateMediaReceiptPolicy.stableMessageID(
                 peerCapabilities: peer(peerID)?.capabilities ?? [],
                 senderPeerID: peerID,
@@ -2679,13 +2796,17 @@ final class WatchBLEController: NSObject, ObservableObject {
             return
         }
         let innerSender = PeerID(hexData: inner.senderID)
-        guard innerSender == senderPeer,
-              isValidForRelayOrDelivery(inner, from: innerSender) else {
-            log("fragment reject \(fragmentID): inner packet rejected")
+        guard innerSender == senderPeer else {
+            log("fragment reject \(fragmentID): sender mismatch")
+            return
+        }
+        if let reason = admissionFailure(for: inner, from: innerSender) {
+            log("fragment reject \(fragmentID): \(reason)")
             return
         }
         inner.ttl = 0
         process(inner, from: innerSender, linkUUID: linkUUID)
+        if !isAppInForeground { enforceBackgroundConnectionBudget() }
     }
 
     private func scheduleFragmentRecoveryCheck() {
@@ -3841,10 +3962,19 @@ extension WatchBLEController: CBCentralManagerDelegate {
                 pendingAttempts: pendingConnectionIDs.count,
                 isAppInForeground: isAppInForeground
             ) else { break }
+            let history = peripheralHistory.snapshot(for: score.id)
+            let cooldown = WatchMeshRuntimePolicy.connectionRetryCooldown(
+                consecutiveFailures: history.consecutiveFailures
+            )
+            if cooldown > 0,
+               let lastFailure = history.lastFailureAt,
+               now.timeIntervalSince(lastFailure) < cooldown {
+                continue
+            }
             guard let candidate = discoveryCandidates.removeValue(forKey: score.id) else {
                 continue
             }
-            let trustedPeerID = peripheralHistory.snapshot(for: score.id).peerID
+            let trustedPeerID = history.peerID
             if trustedPeerID.map(connectedPeerIDs.contains) == true {
                 log("skipping duplicate known peer \(score.id.uuidString.prefix(8))")
                 continue
@@ -3882,6 +4012,11 @@ extension WatchBLEController: CBCentralManagerDelegate {
         let name = advertisementData[CBAdvertisementDataLocalNameKey] as? String
             ?? peripheral.name ?? "bitchat"
         log("discovered \(name) rssi=\(RSSI)")
+        guard RSSI.intValue >= WatchMeshRuntimePolicy.minimumCandidateRSSI else {
+            log("ignoring weak candidate \(peripheral.identifier.uuidString.prefix(8)) rssi=\(RSSI)")
+            refreshConnectionDiagnostics()
+            return
+        }
         enqueueDiscoveryCandidate(
             peripheral,
             rssi: RSSI.intValue,
@@ -3931,6 +4066,7 @@ extension WatchBLEController: CBCentralManagerDelegate {
         connectionRequestedAt.removeValue(forKey: peripheral.identifier)
         connectionPhases.removeValue(forKey: peripheral.identifier)
         recoveryVerificationWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
+        peripheralHistory.recordFailure(peripheral.identifier)
         lastRecoveryReason = "connect failed"
         log("connect failed \(peripheral.identifier.uuidString.prefix(8)): \(error?.localizedDescription ?? "unknown")")
         scheduleReconnect(peripheral)
@@ -4121,7 +4257,9 @@ extension WatchBLEController: CBPeripheralDelegate {
             markLinkReady(peripheral)
             // setNotifyValue is asynchronous. Requesting catch-up during a
             // scene transition can race this callback and lose the response.
-            requestPublicSyncIfNeeded(on: uuid, force: true)
+            // Background drains stay rate-limited: every wake would otherwise
+            // force a per-link sync flood that re-arms the alert oscillation.
+            requestPublicSyncIfNeeded(on: uuid, force: isAppInForeground)
             requestStalledFragments()
         } else if let pending = meshUnsubscribeInFlight[uuid], pending > 0 {
             // Our own unsubscribe request completed; not a peer-initiated
@@ -4195,7 +4333,7 @@ extension WatchBLEController: CBPeripheralDelegate {
                   self.peripherals[uuid] === peripheral,
                   self.announcedReadyLinks.contains(uuid),
                   self.writableCharacteristics[uuid]?.isNotifying == true else { return }
-            self.requestPublicSyncIfNeeded(on: uuid, force: true)
+            self.requestPublicSyncIfNeeded(on: uuid, force: self.isAppInForeground)
         }
         refreshAnnounceHeartbeat()
         drainDiscoveryCandidates()

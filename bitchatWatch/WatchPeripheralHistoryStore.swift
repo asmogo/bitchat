@@ -15,15 +15,23 @@ final class WatchPeripheralHistoryStore {
         let peerID: String?
         let lastSuccessfulAt: Date?
         let lastAttemptAt: Date?
+        let consecutiveFailures: Int
+        let lastFailureAt: Date?
     }
 
     private struct Record: Codable {
         var peerID: String?
         var lastSuccessfulAt: Date?
         var lastAttemptAt: Date?
+        var consecutiveFailures: Int = 0
+        var lastFailureAt: Date?
 
         var mostRecentActivity: Date {
-            max(lastSuccessfulAt ?? .distantPast, lastAttemptAt ?? .distantPast)
+            max(
+                lastSuccessfulAt ?? .distantPast,
+                lastAttemptAt ?? .distantPast,
+                lastFailureAt ?? .distantPast
+            )
         }
     }
 
@@ -53,22 +61,32 @@ final class WatchPeripheralHistoryStore {
         return Snapshot(
             peerID: record?.peerID,
             lastSuccessfulAt: record?.lastSuccessfulAt,
-            lastAttemptAt: record?.lastAttemptAt
+            lastAttemptAt: record?.lastAttemptAt,
+            consecutiveFailures: record?.consecutiveFailures ?? 0,
+            lastFailureAt: record?.lastFailureAt
         )
     }
 
     func recordAttempt(_ peripheralID: UUID, at date: Date = Date()) {
-        var record = records[peripheralID.uuidString]
-            ?? Record(peerID: nil, lastSuccessfulAt: nil, lastAttemptAt: nil)
+        var record = records[peripheralID.uuidString] ?? Record()
         record.lastAttemptAt = date
         records[peripheralID.uuidString] = record
         persist(now: date)
     }
 
     func recordSuccess(_ peripheralID: UUID, at date: Date = Date()) {
-        var record = records[peripheralID.uuidString]
-            ?? Record(peerID: nil, lastSuccessfulAt: nil, lastAttemptAt: nil)
+        var record = records[peripheralID.uuidString] ?? Record()
         record.lastSuccessfulAt = date
+        record.consecutiveFailures = 0
+        record.lastFailureAt = nil
+        records[peripheralID.uuidString] = record
+        persist(now: date)
+    }
+
+    func recordFailure(_ peripheralID: UUID, at date: Date = Date()) {
+        var record = records[peripheralID.uuidString] ?? Record()
+        record.consecutiveFailures += 1
+        record.lastFailureAt = date
         records[peripheralID.uuidString] = record
         persist(now: date)
     }
@@ -78,8 +96,7 @@ final class WatchPeripheralHistoryStore {
         for peripheralID: UUID,
         at date: Date = Date()
     ) {
-        var record = records[peripheralID.uuidString]
-            ?? Record(peerID: nil, lastSuccessfulAt: nil, lastAttemptAt: nil)
+        var record = records[peripheralID.uuidString] ?? Record()
         record.peerID = peerID.id
         record.lastSuccessfulAt = date
         records[peripheralID.uuidString] = record

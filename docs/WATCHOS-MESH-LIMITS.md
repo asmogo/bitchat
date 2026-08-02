@@ -3,13 +3,26 @@
 The watchOS app implements the same Bluetooth-only bitchat wire behavior as
 the Android Wear app where the operating system permits it: signed public
 chat, relaying across established links, gossip sync, Noise direct messages,
-receipts, private media, and voice notes.
+receipts, private media, and voice notes. Peers that never complete the
+Noise-bound capability exchange (current Android) are sent private media via
+the same signed, directed, relay-visible fileTransfer fallback iOS uses, and
+the watch accepts such directed transfers as private media. A peer that did
+prove encrypted private media before stays pinned to it, so a missing or
+expired proof can never force a clear-media downgrade.
 
 It cannot provide the Android foreground-service availability contract.
 watchOS does not support advertising services from `CBPeripheralManager`, so
 the watch is a BLE central only. At least one nearby phone must advertise the
 bitchat service before the watch can discover and join the mesh. Two watches
 cannot discover each other directly.
+
+Noise sessions follow the iOS regeneration policy: an established transport
+ignores non-initial handshake bytes instead of tearing down its keys, and a
+fresh initiation retires the current transport to receive-only quarantine
+until the replacement handshake completes, so messages encrypted to the old
+generation still decrypt in flight. Crossed initiations resolve
+deterministically — the lexicographically lower peer ID keeps the initiator
+role, the higher one yields.
 
 The app declares the `bluetooth-central` background mode, subscribes to the
 bitchat GATT characteristics, and enables Core Bluetooth state restoration.
@@ -38,7 +51,13 @@ watch process is suspended:
 - connect, service-discovery, characteristic-discovery, and notification
   subscription phases have explicit deadlines;
 - stale attempts are cancelled and release their slots instead of waiting
-  forever for Core Bluetooth callbacks;
+  forever for Core Bluetooth callbacks — including immediately on every
+  foreground return, so system-owned background connect requests cannot
+  starve the resume path;
+- peripherals whose connection attempts keep failing cool down with an
+  exponential backoff (up to ten minutes), and fresh discoveries weaker than
+  -90 dBm are never given a slot, so unreachable advertisers cannot occupy
+  all concurrent attempts indefinitely;
 - a central manager that still makes no progress is rebuilt at a bounded
   interval without discarding conversations, authenticated peers, or Noise
   state;
@@ -48,6 +67,11 @@ watch process is suspended:
   allowing duplicate physical links to the same peer to be retired;
 - each ready link announces and requests gossip sync, so reconnection fetches
   messages without requiring an app restart.
+
+The Always-On blur state (scene `.inactive`) is treated as foreground.
+Lowering the wrist to a dimmed screen must not tear down links; only a real
+scene-background transition reduces the transport, and even then links with
+in-flight fragment assemblies are kept until the transfer completes.
 
 Routine presence/sync traffic and discovery are disabled wrist-down; only the
 dedicated message-capable alert characteristic remains subscribed. Links to

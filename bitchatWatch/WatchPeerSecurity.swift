@@ -108,6 +108,9 @@ enum WatchPrivateMediaPolicy: Equatable {
         supportsReceipts: Bool,
         supportsExtendedFragmentSets: Bool
     )
+    /// Signed, directed, relay-visible fileTransfer — iOS's compatibility
+    /// fallback for peers that have not advertised encrypted private media.
+    case legacyFallback
     case blocked
 }
 
@@ -232,6 +235,9 @@ final class WatchPeerSecurityCoordinator {
               valid(authenticatedSession, for: peerID) else {
             return .needsHandshake
         }
+        let pinned = store.isPrivateMediaPinned(
+            fingerprint: Self.fingerprint(authenticatedSession.remoteStaticKey)
+        )
         switch status(peerID: peerID, session: authenticatedSession) {
         case .awaiting, .missing:
             return .awaitingPeerState
@@ -243,11 +249,15 @@ final class WatchPeerSecurityCoordinator {
                     supportsExtendedFragmentSets: state.capabilities.contains(.extendedFragmentSets)
                 )
             }
-            return .blocked
+            // The peer explicitly advertised no encrypted private media. iOS
+            // matches that with the signed directed fallback — unless a prior
+            // proof pinned the capability, which would make this a downgrade.
+            return pinned ? .blocked : .legacyFallback
         case .timedOut:
-            // watchOS never sends the legacy clear-media fallback. A sticky pin
-            // is still persisted to prevent another platform from downgrading.
-            return .blocked
+            // Peers which never answer the state exchange (current Android)
+            // get iOS's signed legacy fallback. A sticky pin still prevents
+            // another platform from forcing a clear-media downgrade.
+            return pinned ? .blocked : .legacyFallback
         }
     }
 
@@ -288,7 +298,7 @@ final class WatchPeerSecurityCoordinator {
             && PeerID(publicKey: session.remoteStaticKey) == peerID
     }
 
-    private static func fingerprint(_ publicKey: Data) -> String {
+    static func fingerprint(_ publicKey: Data) -> String {
         SHA256.hash(data: publicKey)
             .map { String(format: "%02x", $0) }
             .joined()
