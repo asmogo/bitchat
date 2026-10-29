@@ -372,6 +372,8 @@ final class ChatPrivateConversationCoordinator {
         context.appendPrivateMessage(message, to: peerID)
         context.notifyUIChanged()
 
+        guard validatePrivateMessageLength(content, messageID: messageID, peerID: peerID) else { return }
+
         // Always hand the message to the router — it owns delivery. A live
         // link sends now; an unreachable peer gets the retained-outbox path
         // (resend on reconnect, courier deposits, bridge drops). Pre-judging
@@ -420,6 +422,8 @@ final class ChatPrivateConversationCoordinator {
 
         context.appendPrivateMessage(message, to: peerID)
         context.notifyUIChanged()
+
+        guard validatePrivateMessageLength(content, messageID: messageID, peerID: peerID) else { return }
 
         guard let recipientHex = context.nostrKeyMapping[peerID] else {
             context.setPrivateDeliveryStatus(
@@ -480,6 +484,25 @@ final class ChatPrivateConversationCoordinator {
                 peerID: peerID
             )
         }
+    }
+
+    private func validatePrivateMessageLength(_ content: String, messageID: String, peerID: PeerID) -> Bool {
+        // Both mesh and Nostr private messages use the same one-byte TLV
+        // length. Retain invalid text in the conversation for copying, but
+        // never enqueue a payload that neither transport can encode.
+        guard content.utf8.count <= PrivateMessagePacket.maximumContentBytes else {
+            context.setPrivateDeliveryStatus(
+                .failed(reason: String(
+                    localized: "content.delivery.reason.message_too_long",
+                    defaultValue: "Message is too long. Please split it into shorter messages.",
+                    comment: "Failure reason when private text exceeds the wire format's byte limit"
+                )),
+                forMessageID: messageID,
+                peerID: peerID
+            )
+            return false
+        }
+        return true
     }
 
     func handlePrivateMessage(

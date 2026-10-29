@@ -10,6 +10,19 @@ import SwiftUI
 import BitFoundation
 
 extension DeliveryStatus {
+    /// Media transfers reuse partial delivery for locally transmitted fragments;
+    /// those counts are not recipient delivery acknowledgements.
+    var bitchatMediaDescription: String {
+        guard case .partiallyDelivered(let sent, let total) = self else {
+            return bitchatDescription
+        }
+        let sending = DeliveryStatus.sending.bitchatDescription
+        guard total > 0 else { return sending }
+        let progress = min(1, max(0, Double(sent) / Double(total)))
+            .formatted(.percent.precision(.fractionLength(0)))
+        return "\(sending) (\(progress))"
+    }
+
     /// Localized, user-facing description of the status. Used for macOS
     /// tooltips, the tap-to-reveal caption under a message, and VoiceOver —
     /// the glyphs alone are unexplained 10pt icons.
@@ -55,6 +68,7 @@ extension DeliveryStatus {
 struct DeliveryStatusView: View {
     @ThemedPalette private var palette
     let status: DeliveryStatus
+    var isMediaTransfer = false
 
     // MARK: - Computed Properties
 
@@ -62,13 +76,17 @@ struct DeliveryStatusView: View {
 
     private var secondaryTextColor: Color { palette.secondary }
 
+    private var statusDescription: String {
+        isMediaTransfer ? status.bitchatMediaDescription : status.bitchatDescription
+    }
+
     // MARK: - Body
 
     var body: some View {
         statusGlyph
-            .help(status.bitchatDescription)
+            .help(statusDescription)
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(status.bitchatDescription)
+            .accessibilityLabel(statusDescription)
     }
 
     @ViewBuilder
@@ -122,7 +140,7 @@ struct DeliveryStatusView: View {
 
         case .partiallyDelivered(let reached, let total):
             HStack(spacing: 1) {
-                Image(systemName: "checkmark")
+                Image(systemName: isMediaTransfer ? "circle" : "checkmark")
                     .font(.bitchatSystem(size: 10))
                 Text(verbatim: "\(reached)/\(total)")
                     .bitchatFont(size: 10)

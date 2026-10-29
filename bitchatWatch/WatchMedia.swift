@@ -842,8 +842,7 @@ final class WatchAudioPlayer: NSObject, ObservableObject {
         } else {
             guard player.play() else { return }
             isPlaying = true
-            timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) {
-                [weak self] _ in
+            timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.updateProgress() }
             }
         }

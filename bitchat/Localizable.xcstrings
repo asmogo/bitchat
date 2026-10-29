@@ -52036,6 +52036,191 @@
         }
       }
     },
+    "content.delivery.reason.message_too_long" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "الرسالة طويلة جدًا. يُرجى تقسيمها إلى رسائل أقصر."
+          }
+        },
+        "bn" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "বার্তাটি খুব দীর্ঘ। অনুগ্রহ করে এটিকে ছোট ছোট বার্তায় ভাগ করুন।"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Nachricht ist zu lang. Bitte teile sie in kürzere Nachrichten auf."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Message is too long. Please split it into shorter messages."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El mensaje es demasiado largo. Divídelo en mensajes más cortos."
+          }
+        },
+        "fa" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "پیام بیش از حد طولانی است. لطفاً آن را به پیام‌های کوتاه‌تر تقسیم کنید."
+          }
+        },
+        "fil" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Masyadong mahaba ang mensahe. Hatiin ito sa mas maiikling mensahe."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le message est trop long. Veuillez le diviser en messages plus courts."
+          }
+        },
+        "he" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ההודעה ארוכה מדי. יש לפצל אותה להודעות קצרות יותר."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "संदेश बहुत लंबा है। कृपया इसे छोटे संदेशों में बाँटें।"
+          }
+        },
+        "id" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pesan terlalu panjang. Silakan bagi menjadi pesan yang lebih pendek."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Il messaggio è troppo lungo. Dividilo in messaggi più brevi."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "メッセージが長すぎます。短いメッセージに分けてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "메시지가 너무 깁니다. 더 짧은 메시지로 나눠 주세요."
+          }
+        },
+        "ms" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mesej terlalu panjang. Sila bahagikannya kepada mesej yang lebih pendek."
+          }
+        },
+        "ne" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "सन्देश धेरै लामो छ। कृपया यसलाई छोटा सन्देशहरूमा विभाजन गर्नुहोस्।"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Het bericht is te lang. Splits het op in kortere berichten."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wiadomość jest za długa. Podziel ją na krótsze wiadomości."
+          }
+        },
+        "pt" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A mensagem é demasiado longa. Divida-a em mensagens mais curtas."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A mensagem é muito longa. Divida-a em mensagens mais curtas."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сообщение слишком длинное. Разделите его на более короткие сообщения."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Meddelandet är för långt. Dela upp det i kortare meddelanden."
+          }
+        },
+        "ta" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "செய்தி மிக நீளமாக உள்ளது. அதைச் சிறிய செய்திகளாகப் பிரிக்கவும்."
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ข้อความยาวเกินไป โปรดแบ่งเป็นข้อความที่สั้นลง"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mesaj çok uzun. Lütfen daha kısa mesajlara bölün."
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повідомлення задовге. Розділіть його на коротші повідомлення."
+          }
+        },
+        "ur" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "پیغام بہت طویل ہے۔ براہ کرم اسے چھوٹے پیغامات میں تقسیم کریں۔"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tin nhắn quá dài. Vui lòng chia thành các tin nhắn ngắn hơn."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "消息太长。请拆分为较短的消息。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "訊息太長。請拆分為較短的訊息。"
+          }
+        }
+      }
+    },
     "content.delivery.reason.send_error" : {
       "extractionState" : "manual",
       "localizations" : {

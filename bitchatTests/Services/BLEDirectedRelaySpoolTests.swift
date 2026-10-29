@@ -95,6 +95,43 @@ struct BLEDirectedRelaySpoolTests {
     }
 
     @Test
+    func selectiveDrainReleasesBytesAndPreservesOldestFirstEviction() {
+        let recipient = PeerID(str: "1122334455667788")
+        let now = Date(timeIntervalSince1970: 1_000)
+        // Exercise the upstream byte/count bounds together with the watch's
+        // selective retry drain, including expired entries that cannot route.
+        for limits in [(capacity: 10, bytes: 3), (capacity: 3, bytes: 100)] {
+            var spool = BLEDirectedRelaySpool(capacity: limits.capacity, byteBudget: limits.bytes)
+            for index in 0..<3 {
+                spool.enqueue(
+                    packet: makePacket(payload: [UInt8(index)]), recipient: recipient,
+                    messageID: "message-\(index)",
+                    enqueuedAt: index == 0 ? now.addingTimeInterval(-10) : now,
+                    timelyAlertEligible: false
+                )
+            }
+            let ready = spool.drainUnexpired(now: now, window: 5) {
+                $0.packet.payload == Data([2])
+            }
+            #expect(ready.map(\.packet.payload) == [Data([2])])
+            #expect(spool.count == 1)
+
+            for index in 3...4 {
+                spool.enqueue(packet: makePacket(payload: [UInt8(index)]), recipient: recipient,
+                              messageID: "message-\(index)", enqueuedAt: now)
+            }
+            #expect(spool.count == 3)
+            let stillWaiting = spool.drainUnexpired(now: now, window: 5) { _ in false }
+            #expect(stillWaiting.isEmpty)
+            spool.enqueue(packet: makePacket(payload: [5]), recipient: recipient,
+                          messageID: "message-5", enqueuedAt: now)
+            let drained = spool.drainUnexpired(now: now, window: 5)
+            #expect(drained.map(\.packet.payload) == [Data([3]), Data([4]), Data([5])])
+            #expect(spool.isEmpty)
+        }
+    }
+
+    @Test
     func drainPreservesTimelyAlertEligibility() {
         let recipient = PeerID(str: "1122334455667788")
         let now = Date()

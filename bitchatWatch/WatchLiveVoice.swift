@@ -345,8 +345,7 @@ final class WatchPTTBurstPlayer {
 
     private func schedule(_ buffer: AVAudioPCMBuffer) {
         pendingBuffers += 1
-        node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) {
-            [weak self] _ in
+        node.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self, !self.stopped else { return }
                 self.pendingBuffers = max(0, self.pendingBuffers - 1)

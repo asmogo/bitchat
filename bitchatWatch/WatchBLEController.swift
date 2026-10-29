@@ -4235,7 +4235,6 @@ extension WatchBLEController: CBCentralManagerDelegate {
         retiredDuplicateLinks.remove(peripheral.identifier)
         recoveryVerificationWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
         reconnectWorkItems.removeValue(forKey: peripheral.identifier)?.cancel()
-        reconnectAttempts.removeValue(forKey: peripheral.identifier)
         connectionRequestedAt.removeValue(forKey: peripheral.identifier)
         let topologyChanged = removeDirectPeer(on: peripheral.identifier)
         writableCharacteristics.removeValue(forKey: peripheral.identifier)
@@ -4507,8 +4506,7 @@ extension WatchBLEController: CBPeripheralDelegate {
                     )
                     return
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                    [weak self, weak peripheral, weak characteristic] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak peripheral, weak characteristic] in
                     guard let self, let peripheral, let characteristic,
                           self.running,
                           self.peripherals[uuid] === peripheral,
@@ -4606,6 +4604,9 @@ extension WatchBLEController: CBPeripheralDelegate {
         lastBluetoothProgressAt = now
         connectionPhases.removeValue(forKey: uuid)
         connectionRequestedAt.removeValue(forKey: uuid)
+        // A radio connection is not a usable mesh link. Preserve backoff
+        // through service discovery and subscription failures.
+        reconnectAttempts.removeValue(forKey: uuid)
         peripheralHistory.recordSuccess(uuid, at: now)
         let becameReady = announcedReadyLinks.insert(uuid).inserted
         consecutivePhaseTimeouts = 0
@@ -4642,6 +4643,7 @@ extension WatchBLEController: CBPeripheralDelegate {
 
     private func failLink(_ peripheral: CBPeripheral, reason: String) {
         guard peripherals[peripheral.identifier] === peripheral else { return }
+        peripheralHistory.recordFailure(peripheral.identifier)
         let topologyChanged = removeDirectPeer(on: peripheral.identifier)
         connectionRequestedAt.removeValue(forKey: peripheral.identifier)
         connectionPhases.removeValue(forKey: peripheral.identifier)

@@ -1169,6 +1169,63 @@ struct ChatPrivateConversationCoordinatorContextTests {
         #expect(context.meshOnlySystemMessages == ["alice#1234 favorited you"])
     }
 
+    @Test(arguments: [String(repeating: "a", count: 256), String(repeating: "🔒", count: 64)])
+    @MainActor
+    func oversizedPrivateMessageFailsWithoutRouting(content: String) async throws {
+        for connected in [false, true] {
+            let context = MockChatPrivateConversationContext()
+            let peerID = PeerID(str: "0011223344556688")
+            if connected { context.connectedPeers.insert(peerID) }
+            let coordinator = ChatPrivateConversationCoordinator(context: context)
+
+            coordinator.sendPrivateMessage(content, to: peerID)
+
+            let message = try #require(context.privateChats[peerID]?.first)
+            #expect(message.content == content)
+            guard case .failed = message.deliveryStatus else {
+                Issue.record("Oversized private text must fail instead of remaining sending/sent")
+                continue
+            }
+            #expect(context.routedPrivateMessages.isEmpty)
+        }
+    }
+
+    @Test(arguments: [String(repeating: "a", count: 255), String(repeating: "🔒", count: 63) + "éa"])
+    @MainActor
+    func privateMessageAtUTF8LimitStillRoutes(content: String) async {
+        let context = MockChatPrivateConversationContext()
+        let peerID = PeerID(str: "0011223344556688")
+        context.connectedPeers.insert(peerID)
+        let coordinator = ChatPrivateConversationCoordinator(context: context)
+
+        coordinator.sendPrivateMessage(content, to: peerID)
+
+        #expect(content.utf8.count == 255)
+        #expect(context.routedPrivateMessages.map(\.content) == [content])
+        #expect(context.privateChats[peerID]?.first?.deliveryStatus == .sent)
+    }
+
+    @Test @MainActor
+    func oversizedGeohashPrivateMessageFailsWithoutSending() async throws {
+        let context = MockChatPrivateConversationContext()
+        context.activeChannel = .location(GeohashChannel(level: .city, geohash: "u4pruy"))
+        let recipient = String(repeating: "ab", count: 32)
+        let peerID = PeerID(nostr_: recipient)
+        context.nostrKeyMapping[peerID] = recipient
+        let content = String(repeating: "🔒", count: 64)
+        let coordinator = ChatPrivateConversationCoordinator(context: context)
+
+        coordinator.sendPrivateMessage(content, to: peerID)
+
+        let message = try #require(context.privateChats[peerID]?.first)
+        #expect(message.content == content)
+        guard case .failed = message.deliveryStatus else {
+            Issue.record("Oversized geohash text must fail instead of claiming sent")
+            return
+        }
+        #expect(context.geoPrivateMessages.isEmpty)
+    }
+
     @Test @MainActor
     func sendPrivateMessage_routesViaMutualFavoriteNostrWhenPeerOffline() async {
         let context = MockChatPrivateConversationContext()

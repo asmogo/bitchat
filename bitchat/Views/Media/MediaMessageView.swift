@@ -70,7 +70,7 @@ struct MediaMessageView: View {
                         Button {
                             showDeliveryDetail.toggle()
                         } label: {
-                            DeliveryStatusView(status: deliveryStatus)
+                            DeliveryStatusView(status: deliveryStatus, isMediaTransfer: true)
                                 .padding(.leading, 4)
                                 .contentShape(Rectangle())
                         }
@@ -86,12 +86,12 @@ struct MediaMessageView: View {
                 if message.isPrivate && conversationUIModel.isSentByCurrentUser(message),
                    deliveryStatus != .notSentYet {
                     if case .failed = deliveryStatus {
-                        Text(verbatim: deliveryStatus.bitchatDescription)
+                        Text(verbatim: deliveryStatus.bitchatMediaDescription)
                             .bitchatFont(size: 11)
                             .foregroundColor(Color.red.opacity(0.9))
                             .fixedSize(horizontal: false, vertical: true)
                     } else if showDeliveryDetail {
-                        Text(verbatim: deliveryStatus.bitchatDescription)
+                        Text(verbatim: deliveryStatus.bitchatMediaDescription)
                             .bitchatFont(size: 11)
                             .foregroundColor(palette.secondary)
                             .fixedSize(horizontal: false, vertical: true)
