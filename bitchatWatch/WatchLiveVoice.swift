@@ -465,7 +465,7 @@ final class WatchLiveVoiceCoordinator {
         }
         let key = Key(peerID: peerID, scope: scope, burstID: packet.burstID)
         if let assembly = assemblies[key] {
-            apply(packet, to: assembly)
+            apply(packet, encodedByteCount: payload.count, to: assembly)
             return
         }
 
@@ -476,10 +476,10 @@ final class WatchLiveVoiceCoordinator {
                     key: key,
                     nickname: nickname,
                     timestamp: timestamp
-                  ) else { return }
+            ) else { return }
             assemblies[key] = assembly
             updatePublicTalker()
-            apply(packet, to: assembly)
+            apply(packet, encodedByteCount: payload.count, to: assembly)
         case .end, .canceled:
             break
         }
@@ -609,8 +609,15 @@ final class WatchLiveVoiceCoordinator {
         return assembly
     }
 
-    private func apply(_ packet: VoiceBurstPacket, to assembly: Assembly) {
-        assembly.receivedBytes += packet.encode().count
+    private func apply(
+        _ packet: VoiceBurstPacket,
+        encodedByteCount: Int,
+        to assembly: Assembly
+    ) {
+        // `payload` already contained the canonical wire encoding. Re-encoding
+        // every live frame solely to count it added avoidable allocations on
+        // the hottest audio receive path.
+        assembly.receivedBytes += encodedByteCount
         let elapsed = Date().timeIntervalSince(assembly.firstPacketAt)
         guard assembly.receivedBytes <= TransportConfig.pttMaxBurstBytes,
               assembly.receivedBytes
@@ -685,8 +692,12 @@ final class WatchLiveVoiceCoordinator {
     private func finalize(_ assembly: Assembly) {
         assembly.idleTimeout?.cancel()
         assembly.gapRedrain?.cancel()
-        while let sequence = assembly.buffered.keys.min(),
-              let frames = assembly.buffered.removeValue(forKey: sequence) {
+        // Missing trains may leave hundreds of out-of-order packets. Sorting
+        // once avoids the quadratic repeated `keys.min()` scan during timeout
+        // finalization.
+        let buffered = assembly.buffered.sorted { $0.key < $1.key }
+        assembly.buffered.removeAll(keepingCapacity: false)
+        for (sequence, frames) in buffered {
             assembly.nextSequence = sequence &+ 1
             deliver(frames, to: assembly)
         }

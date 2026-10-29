@@ -1,4 +1,5 @@
 import BitFoundation
+import CryptoKit
 import Foundation
 import Testing
 @testable import bitchat
@@ -77,18 +78,18 @@ struct WatchParityTests {
         #expect(WatchBLEController.maxPrivateContentBytes == 255)
     }
 
-    @Test("notification policy alerts unless the receiving conversation is visible")
+    @Test("notification policy alerts unless the receiving conversation is interactive")
     func notificationPolicy() {
         #expect(WatchNotifications.shouldScheduleAlert(
-            isAppInForeground: false,
+            isAppInteractive: false,
             isConversationActive: true
         ))
         #expect(WatchNotifications.shouldScheduleAlert(
-            isAppInForeground: true,
+            isAppInteractive: true,
             isConversationActive: false
         ))
         #expect(!WatchNotifications.shouldScheduleAlert(
-            isAppInForeground: true,
+            isAppInteractive: true,
             isConversationActive: true
         ))
     }
@@ -163,6 +164,55 @@ struct WatchParityTests {
         #expect(restored?.nickname == "alice")
         #expect(restored?.signingPublicKey == signingKey)
         #expect(restored?.capabilities == [.privateMedia])
+    }
+
+    @Test("unchanged peer heartbeats coalesce durable preference writes")
+    func knownPeerHeartbeatPersistenceIsCoalesced() throws {
+        let suite = "watch-known-peer-heartbeat-tests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = Data((0..<32).map(UInt8.init))
+        let peerID = PeerID(publicKey: key)
+        // Keep the fixture inside the store's 30-day retention window; a
+        // historical fixed date is correctly pruned by a newly constructed
+        // store before these persistence assertions run.
+        let base = Date()
+        let store = WatchKnownPeerStore(defaults: defaults, storageKey: "peers")
+
+        func peer(at date: Date, nickname: String = "alice") -> WatchPeer {
+            WatchPeer(
+                peerID: peerID,
+                nickname: nickname,
+                noisePublicKey: key,
+                signingPublicKey: Data(repeating: 7, count: 32),
+                lastSeen: date,
+                capabilities: [.privateMedia]
+            )
+        }
+
+        store.remember(peer(at: base))
+        store.remember(peer(at: base.addingTimeInterval(60)))
+        var restored = WatchKnownPeerStore(
+            defaults: defaults,
+            storageKey: "peers"
+        ).peer(peerID)
+        #expect(restored?.lastSeen == base)
+
+        // Identity changes still persist immediately inside the interval.
+        store.remember(peer(at: base.addingTimeInterval(90), nickname: "alice2"))
+        restored = WatchKnownPeerStore(
+            defaults: defaults,
+            storageKey: "peers"
+        ).peer(peerID)
+        #expect(restored?.nickname == "alice2")
+        #expect(restored?.lastSeen == base.addingTimeInterval(90))
+
+        store.remember(peer(at: base.addingTimeInterval(5 * 60 + 91)))
+        restored = WatchKnownPeerStore(
+            defaults: defaults,
+            storageKey: "peers"
+        ).peer(peerID)
+        #expect(restored?.lastSeen == base.addingTimeInterval(5 * 60 + 91))
     }
 
     @Test("watch mesh keeps discovery armed until Android-compatible link capacity")
@@ -336,6 +386,35 @@ struct WatchParityTests {
             consecutiveFailures: 20
         ) == 600)
         #expect(WatchMeshRuntimePolicy.minimumCandidateRSSI == -90)
+    }
+
+    @Test("recently working links get one eager retry without starving slots")
+    func recentSuccessReconnectBypass() {
+        let now = Date()
+        #expect(!WatchMeshRuntimePolicy.shouldSkipConnectionAttempt(
+            consecutiveFailures: 2,
+            lastFailureAt: now.addingTimeInterval(-10),
+            lastSuccessfulAt: now.addingTimeInterval(-60),
+            now: now
+        ))
+        #expect(WatchMeshRuntimePolicy.shouldSkipConnectionAttempt(
+            consecutiveFailures: 5,
+            lastFailureAt: now.addingTimeInterval(-10),
+            lastSuccessfulAt: now.addingTimeInterval(-60),
+            now: now
+        ))
+        #expect(WatchMeshRuntimePolicy.shouldSkipConnectionAttempt(
+            consecutiveFailures: 5,
+            lastFailureAt: now.addingTimeInterval(-10),
+            lastSuccessfulAt: now.addingTimeInterval(-3_600),
+            now: now
+        ))
+        #expect(!WatchMeshRuntimePolicy.shouldSkipConnectionAttempt(
+            consecutiveFailures: 0,
+            lastFailureAt: nil,
+            lastSuccessfulAt: nil,
+            now: now
+        ))
     }
 
     @Test("conflicting duplicate fragments overwrite instead of destroying the stream")
@@ -612,6 +691,10 @@ struct WatchParityTests {
             WatchSyncRequest.publicPayload(packetIDs: [])
         )
         #expect(empty != nil)
+        let bounded = WatchSyncRequest.decode(
+            WatchSyncRequest.publicPayload(packetIDs: [], sinceTimestamp: 1_700_000)
+        )
+        #expect(bounded?.sinceTimestamp == 1_700_000)
         #expect(store.missingPackets(
             for: empty!,
             nowMilliseconds: WatchPacketFactory.nowMilliseconds()
@@ -629,6 +712,96 @@ struct WatchParityTests {
             for: populated!,
             nowMilliseconds: WatchPacketFactory.nowMilliseconds()
         ).isEmpty)
+    }
+
+    @Test("bounded GCS requests advertise their exact covered timeline")
+    func publicGossipCoverageCursor() throws {
+        let candidates = (0..<500).map { index in
+            WatchSyncCandidate(
+                packetID: Data(SHA256.hash(
+                    data: Data("watch-sync-\(index)".utf8)
+                ).prefix(16)),
+                timestamp: 10_000 - UInt64(index)
+            )
+        }
+
+        let request = try #require(WatchSyncRequest.decode(
+            WatchSyncRequest.publicPayload(
+                candidates: candidates,
+                minimumTimestamp: 1_000
+            )
+        ))
+        let cursor = try #require(request.sinceTimestamp)
+        let coveredTail = try #require(candidates.firstIndex {
+            $0.timestamp == cursor
+        })
+
+        #expect(coveredTail > 0)
+        #expect(coveredTail < candidates.count - 1)
+        #expect(cursor > 1_000)
+    }
+
+    @Test("watch gossip retention keeps the newest packets after sustained traffic")
+    func publicGossipRetentionOrder() {
+        let store = WatchGossipStore()
+        let now = WatchPacketFactory.nowMilliseconds()
+        let oldestTimestamp = now - 700
+        for index in 0..<700 {
+            store.record(BitchatPacket(
+                type: MessageType.message.rawValue,
+                senderID: Data(repeating: 3, count: 8),
+                recipientID: nil,
+                timestamp: oldestTimestamp + UInt64(index),
+                payload: Data("retained-\(index)".utf8),
+                signature: Data(repeating: 4, count: 64),
+                ttl: 7
+            ))
+        }
+
+        let retained = store.publicSyncCandidates(nowMilliseconds: now)
+        #expect(retained.count == 500)
+        #expect(retained.first?.timestamp == oldestTimestamp + 699)
+        #expect(retained.last?.timestamp == oldestTimestamp + 200)
+    }
+
+    @Test("watch gossip bounds rotating announcement identities")
+    func publicGossipAnnouncementCapacity() {
+        let store = WatchGossipStore()
+        let now = WatchPacketFactory.nowMilliseconds()
+        for index in 0..<200 {
+            var sender = UInt64(index + 1).bigEndian
+            let senderID = withUnsafeBytes(of: &sender) { Data($0) }
+            store.record(BitchatPacket(
+                type: MessageType.announce.rawValue,
+                senderID: senderID,
+                recipientID: nil,
+                timestamp: now - UInt64(200 - index),
+                payload: Data("announce-\(index)".utf8),
+                signature: Data(repeating: 5, count: 64),
+                ttl: 7
+            ))
+        }
+
+        let retained = store.publicSyncCandidates(nowMilliseconds: now)
+        #expect(retained.count == 128)
+        #expect(retained.first?.timestamp == now - 1)
+        #expect(retained.last?.timestamp == now - 128)
+    }
+
+    @Test("Noise initiation retries retransmit the same message one")
+    func noiseInitiationRetryIsTranscriptStable() throws {
+        let manager = WatchNoiseManager(identity: .shared)
+        let remoteStatic = Curve25519.KeyAgreement.PrivateKey()
+            .publicKey.rawRepresentation
+        let peerID = PeerID(publicKey: remoteStatic)
+        defer { manager.clear(peerID) }
+
+        let firstResult = try manager.initiate(with: peerID)
+        let retryResult = try manager.initiate(with: peerID)
+        let first = try #require(firstResult)
+        let retry = try #require(retryResult)
+
+        #expect(first == retry)
     }
 
     @Test("media retention evicts oldest references above the watch budget")

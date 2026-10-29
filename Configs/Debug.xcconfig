@@ -1,1 +1,6 @@
 #include "Release.xcconfig"
+
+// Developer-specific signing and bundle identifiers are for local builds.
+// Keeping this out of Release prevents archives from silently inheriting a
+// workstation's ignored Local.xcconfig values.
+#include? "Local.xcconfig"

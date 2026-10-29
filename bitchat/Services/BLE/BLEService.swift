@@ -176,6 +176,14 @@ private final class BLEPrivateMediaTransferAdmissionRegistry {
     }
 }
 
+/// One queue-consistent physical-link view for outbound planning. The link
+/// dictionary is a copy-on-write snapshot, so direct lookup does not require
+/// a second `bleQueue.sync` and bulk planning can filter its values directly.
+private struct BLEOutboundPhysicalLinkSnapshot {
+    let peripheralStatesByID: [String: BLEPeripheralLinkState]
+    let subscribedCentrals: BLESubscribedCentralSnapshot
+}
+
 /// BLEService — Bluetooth Mesh Transport
 /// - Emits events exclusively via `BitchatDelegate` for UI.
 /// - ChatViewModel must consume delegate callbacks (`didReceivePublicMessage`, `didReceiveNoisePayload`).
@@ -349,6 +357,11 @@ final class BLEService: NSObject {
     var peripheralManager: CBPeripheralManager?
     var characteristic: CBMutableCharacteristic?
     var alertCharacteristic: CBMutableCharacteristic?
+    /// Set only when Core Bluetooth handed this process an already-published
+    /// GATT database. The powered-on callback must preserve that database;
+    /// removing it also destroys the restored watch subscriptions.
+    var hasRestoredPeripheralGattService = false
+    let centralPeerRestorationHints = BLECentralPeerRestorationHintStore()
     private let shouldInitializeBluetoothManagers: Bool
     private let panicLifecycleLock = NSLock()
     private var _isPanicSuspended: Bool
@@ -1869,7 +1882,10 @@ final class BLEService: NSObject {
         if noiseService.hasEstablishedSession(with: peerID) {
             SecureLogger.debug("📤 Sending READ receipt id=\(receipt.originalMessageID.prefix(8))… to \(peerID.id.prefix(8))…", category: .session)
             do {
-                broadcastPacket(try makeEncryptedNoisePacket(payload, to: peerID))
+                broadcastPacket(
+                    try makeEncryptedNoisePacket(payload, to: peerID),
+                    allowTimelyAlert: false
+                )
             } catch {
                 SecureLogger.error("Failed to send read receipt: \(error)")
             }
@@ -1974,7 +1990,8 @@ final class BLEService: NSObject {
     private func broadcastPacket(
         _ packet: BitchatPacket,
         transferId: String? = nil,
-        requiresPrivateMediaAdmission: Bool = false
+        requiresPrivateMediaAdmission: Bool = false,
+        allowTimelyAlert: Bool = true
     ) {
         guard !isPanicSuspended else {
             if requiresPrivateMediaAdmission, let transferId {
@@ -2124,38 +2141,72 @@ final class BLEService: NSObject {
             return
         }
         if packetToSend.type == MessageType.noiseEncrypted.rawValue {
-            sendEncrypted(packetToSend, data: data, pad: padForBLE)
+            sendEncrypted(
+                packetToSend,
+                data: data,
+                pad: padForBLE,
+                allowTimelyAlert: allowTimelyAlert
+            )
             return
         }
-        sendGenericBroadcast(packetToSend, data: data, pad: padForBLE)
+        sendGenericBroadcast(
+            packetToSend,
+            data: data,
+            pad: padForBLE,
+            allowTimelyAlert: allowTimelyAlert
+        )
     }
 
-    private func sendEncrypted(_ packet: BitchatPacket, data: Data, pad: Bool) {
+    private func sendEncrypted(
+        _ packet: BitchatPacket,
+        data: Data,
+        pad: Bool,
+        allowTimelyAlert: Bool
+    ) {
         guard let recipientPeerID = PeerID(hexData: packet.recipientID) else { return }
         var sentEncrypted = false
 
         let outboundPriority = BLEOutboundPacketPolicy.priority(for: packet, data: data)
 
         // Per-link limits for the specific peer
-        let directPeripheralState = snapshotDirectPeripheralState(for: recipientPeerID)
-        let centralSnapshot = snapshotSubscribedCentrals()
-        let recipientCentral = centralSnapshot.central(for: recipientPeerID)
-        let recipientUsesAlertLane = recipientCentral.map {
+        let preferredPeripheralID = linkBindings.preferredPeripheralUUID(for: recipientPeerID)
+        let physicalSnapshot = snapshotOutboundPhysicalLinks()
+        let directPeripheralState = preferredPeripheralID.flatMap {
+            physicalSnapshot.peripheralStatesByID[$0]
+        }
+        let centralSnapshot = physicalSnapshot.subscribedCentrals
+        let boundRecipientCentral = centralSnapshot.central(for: recipientPeerID)
+        let boundRecipientUsesAlertLane = boundRecipientCentral.map {
             centralSnapshot.usesAlertLane($0)
         } ?? false
+        let recipientCentral = allowTimelyAlert || !boundRecipientUsesAlertLane
+            ? boundRecipientCentral
+            : nil
+        let recipientUsesAlertLane = recipientCentral != nil && boundRecipientUsesAlertLane
         let centralData = recipientUsesAlertLane
             ? (BLEOutboundPacketPolicy.timelyAlertData(for: packet) ?? data)
             : data
 
-        if let peripheralMaxLen = directPeripheralState?.peripheral.maximumWriteValueLength(for: .withoutResponse),
-           data.count > peripheralMaxLen {
-            let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(
-                forLinkLimit: peripheralMaxLen,
-                packet: packet,
-                hasDirectedRecipient: true
+        if let directPeripheralState,
+           directPeripheralState.isConnected,
+           directPeripheralState.characteristic != nil {
+            let peripheralMaxLen = directPeripheralState.peripheral.maximumWriteValueLength(
+                for: .withoutResponse
             )
-            sendFragmentedPacket(packet, pad: pad, maxChunk: chunk, directedOnlyPeer: recipientPeerID)
-            return
+            if data.count > peripheralMaxLen {
+                let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(
+                    forLinkLimit: peripheralMaxLen,
+                    packet: packet,
+                    hasDirectedRecipient: true
+                )
+                sendFragmentedPacket(
+                    packet,
+                    pad: pad,
+                    maxChunk: chunk,
+                    directedOnlyPeer: recipientPeerID
+                )
+                return
+            }
         }
         if let centralMaxLen = recipientCentral?.maximumUpdateValueLength,
            centralData.count > centralMaxLen {
@@ -2163,7 +2214,7 @@ final class BLEService: NSObject {
                let recipientCentral,
                let alertCharacteristic {
                 let signal = BLETimelyAlertSignal.encode(for: packet)
-                _ = notifyOrEnqueueIfAccepted(
+                let accepted = notifyOrEnqueueIfAccepted(
                     data: signal,
                     centrals: [recipientCentral],
                     characteristic: alertCharacteristic,
@@ -2171,7 +2222,11 @@ final class BLEService: NSObject {
                     requiredAuthenticatedPeer: recipientPeerID,
                     alertLane: true
                 )
-                spoolDirectedPacket(packet, recipientPeerID: recipientPeerID)
+                spoolDirectedPacket(
+                    packet,
+                    recipientPeerID: recipientPeerID,
+                    timelyAlertEligible: !accepted
+                )
                 return
             }
             let chunk = BLEOutboundPacketPolicy.fragmentChunkSize(
@@ -2197,20 +2252,16 @@ final class BLEService: NSObject {
             let selectedCharacteristic = recipientUsesAlertLane
                 ? alertCharacteristic
                 : characteristic
-            let success = selectedCharacteristic.flatMap {
-                peripheralManager?.updateValue(
-                    centralData,
-                    for: $0,
-                    onSubscribedCentrals: [recipientCentral]
-                )
-            } ?? false
-            if success {
-                sentEncrypted = true
-            } else if selectedCharacteristic != nil {
-                enqueuePendingNotification(
+            if let selectedCharacteristic {
+                // Queue admission is a successful physical handoff. Falling
+                // through after backpressure used to enqueue the same alert a
+                // second time via sendOnAllLinks, wasting a scarce watch wake.
+                sentEncrypted = notifyOrEnqueueIfAccepted(
                     data: centralData,
                     centrals: [recipientCentral],
+                    characteristic: selectedCharacteristic,
                     context: recipientUsesAlertLane ? "background encrypted alert" : "encrypted",
+                    requiredAuthenticatedPeer: recipientPeerID,
                     alertLane: recipientUsesAlertLane
                 )
             }
@@ -2218,12 +2269,83 @@ final class BLEService: NSObject {
 
         if !sentEncrypted {
             // Flood as last resort with recipient set; link aware
-            sendOnAllLinks(packet: packet, data: data, pad: pad, directedOnlyPeer: recipientPeerID)
+            sendOnAllLinks(
+                packet: packet,
+                data: data,
+                pad: pad,
+                directedOnlyPeer: recipientPeerID,
+                allowTimelyAlert: allowTimelyAlert
+            )
         }
     }
 
-    private func sendGenericBroadcast(_ packet: BitchatPacket, data: Data, pad: Bool) {
-        sendOnAllLinks(packet: packet, data: data, pad: pad, directedOnlyPeer: nil)
+    private func sendGenericBroadcast(
+        _ packet: BitchatPacket,
+        data: Data,
+        pad: Bool,
+        allowTimelyAlert: Bool
+    ) {
+        if packet.type == MessageType.noiseHandshake.rawValue,
+           sendNoiseHandshakeOnAlertLaneIfAvailable(
+               packet,
+               allowTimelyAlert: allowTimelyAlert
+           ) {
+            return
+        }
+        sendOnAllLinks(
+            packet: packet,
+            data: data,
+            pad: pad,
+            directedOnlyPeer: nil,
+            allowTimelyAlert: allowTimelyAlert
+        )
+    }
+
+    /// Noise handshakes normally use padded BLE frames. On an alert-only
+    /// watch that padding can turn the one packet needed to wake/re-authenticate
+    /// the link into a fragment train on the currently disabled mesh lane.
+    /// Send the opaque handshake unpadded on the dedicated indication lane;
+    /// if it still does not fit, send one compact wake signal and spool the
+    /// original until the watch reopens its mesh subscription.
+    private func sendNoiseHandshakeOnAlertLaneIfAvailable(
+        _ packet: BitchatPacket,
+        allowTimelyAlert: Bool
+    ) -> Bool {
+        guard allowTimelyAlert,
+              let recipientPeerID = PeerID(hexData: packet.recipientID),
+              let alertData = BLEOutboundPacketPolicy.timelyAlertData(for: packet),
+              let alertCharacteristic else { return false }
+        let snapshot = snapshotOutboundPhysicalLinks().subscribedCentrals
+        guard let central = snapshot.central(for: recipientPeerID),
+              snapshot.usesAlertLane(central) else { return false }
+
+        if alertData.count <= central.maximumUpdateValueLength {
+            return notifyOrEnqueueIfAccepted(
+                data: alertData,
+                centrals: [central],
+                characteristic: alertCharacteristic,
+                context: "background Noise handshake",
+                requiredAuthenticatedPeer: nil,
+                alertLane: true
+            )
+        }
+
+        let accepted = notifyOrEnqueueIfAccepted(
+            data: BLETimelyAlertSignal.encode(for: packet),
+            centrals: [central],
+            characteristic: alertCharacteristic,
+            context: "oversized background handshake signal",
+            requiredAuthenticatedPeer: nil,
+            alertLane: true
+        )
+        if accepted {
+            spoolDirectedPacket(
+                packet,
+                recipientPeerID: recipientPeerID,
+                timelyAlertEligible: false
+            )
+        }
+        return accepted
     }
 
     private func enqueuePendingNotification(
@@ -2404,7 +2526,8 @@ final class BLEService: NSObject {
         dataCount: Int,
         directedOnlyPeer: PeerID?,
         requireDirectPeerLink: Bool,
-        requireNoiseAuthenticatedPeerLink: Bool
+        requireNoiseAuthenticatedPeerLink: Bool,
+        allowTimelyAlert: Bool = true
     ) -> (
         plan: BLEOutboundLinkPlan,
         connectedStates: [BLEPeripheralLinkState],
@@ -2422,36 +2545,59 @@ final class BLEService: NSObject {
             excludedPeerLinks.formUnion(boundLinks.subtracting(authenticatedLinks))
         }
 
-        let states = snapshotPeripheralStates()
+        let physicalSnapshot = snapshotOutboundPhysicalLinks()
         // A link without a discovered characteristic cannot be written to
         // (the write loop below skips it); offering it to the planner only
         // wastes fanout slots — and a peer's single collapsed copy would be
         // silently dropped if its bound link is still mid-rediscovery.
-        let connectedStates = states.filter { $0.isConnected && $0.characteristic != nil }
-        let centralSnapshot = snapshotSubscribedCentrals()
-        let canUseAlertLane = BLEOutboundPacketPolicy.isTimelyAlertCandidate(packet)
-            && alertCharacteristic != nil
-        let subscribedCentrals = centralSnapshot.centrals.filter { central in
-            centralSnapshot.primaryCentralIDs.contains(central.identifier.uuidString)
-                || (canUseAlertLane && centralSnapshot.usesAlertLane(central))
+        let connectedStates = physicalSnapshot.peripheralStatesByID.values.filter {
+            $0.isConnected && $0.characteristic != nil
         }
-        let connectedPeripheralIDs = connectedStates.map { $0.peripheral.identifier.uuidString }
-        let centralIDs = subscribedCentrals.map { $0.identifier.uuidString }
-        let peripheralPeerBindings = Dictionary(
-            uniqueKeysWithValues: connectedStates.compactMap { state -> (String, PeerID)? in
-                let uuid = state.peripheral.identifier.uuidString
-                return linkBindings.peer(forPeripheralID: uuid).map { (uuid, $0) }
+        let centralSnapshot = physicalSnapshot.subscribedCentrals
+        let canUseAlertLane = allowTimelyAlert
+            && BLEOutboundPacketPolicy.isTimelyAlertCandidate(packet)
+            && alertCharacteristic != nil
+
+        var subscribedCentrals: [CBCentral] = []
+        var centralIDs: [String] = []
+        var centralNotifyLimits: [Int] = []
+        subscribedCentrals.reserveCapacity(centralSnapshot.centrals.count)
+        centralIDs.reserveCapacity(centralSnapshot.centrals.count)
+        centralNotifyLimits.reserveCapacity(centralSnapshot.centrals.count)
+        for central in centralSnapshot.centrals {
+            let centralID = central.identifier.uuidString
+            guard centralSnapshot.primaryCentralIDs.contains(centralID)
+                    || (canUseAlertLane && centralSnapshot.alertOnlyCentralIDs.contains(centralID)) else {
+                continue
             }
-        )
+            subscribedCentrals.append(central)
+            centralIDs.append(centralID)
+            centralNotifyLimits.append(central.maximumUpdateValueLength)
+        }
+
+        var connectedPeripheralIDs: [String] = []
+        var peripheralWriteLimits: [Int] = []
+        var peripheralPeerBindings: [String: PeerID] = [:]
+        connectedPeripheralIDs.reserveCapacity(connectedStates.count)
+        peripheralWriteLimits.reserveCapacity(connectedStates.count)
+        peripheralPeerBindings.reserveCapacity(connectedStates.count)
+        for state in connectedStates {
+            let peripheralID = state.peripheral.identifier.uuidString
+            connectedPeripheralIDs.append(peripheralID)
+            peripheralWriteLimits.append(
+                state.peripheral.maximumWriteValueLength(for: .withoutResponse)
+            )
+            if let peerID = linkBindings.peer(forPeripheralID: peripheralID) {
+                peripheralPeerBindings[peripheralID] = peerID
+            }
+        }
         let plan = BLEOutboundLinkPlanner.plan(
             packet: packet,
             dataCount: dataCount,
             peripheralIDs: connectedPeripheralIDs,
-            peripheralWriteLimits: connectedStates.map {
-                $0.peripheral.maximumWriteValueLength(for: .withoutResponse)
-            },
+            peripheralWriteLimits: peripheralWriteLimits,
             centralIDs: centralIDs,
-            centralNotifyLimits: subscribedCentrals.map(\.maximumUpdateValueLength),
+            centralNotifyLimits: centralNotifyLimits,
             ingressRecord: ingressRecord,
             excludedLinks: excludedPeerLinks,
             peripheralPeerBindings: peripheralPeerBindings,
@@ -2481,7 +2627,8 @@ final class BLEService: NSObject {
         pad: Bool,
         directedOnlyPeer: PeerID?,
         requireDirectPeerLink: Bool = false,
-        requireNoiseAuthenticatedPeerLink: Bool = false
+        requireNoiseAuthenticatedPeerLink: Bool = false,
+        allowTimelyAlert: Bool = true
     ) -> Bool {
         guard !isPanicSuspended else { return false }
         let outboundPriority = BLEOutboundPacketPolicy.priority(for: packet, data: data)
@@ -2490,7 +2637,8 @@ final class BLEService: NSObject {
             dataCount: data.count,
             directedOnlyPeer: directedOnlyPeer,
             requireDirectPeerLink: requireDirectPeerLink,
-            requireNoiseAuthenticatedPeerLink: requireNoiseAuthenticatedPeerLink
+            requireNoiseAuthenticatedPeerLink: requireNoiseAuthenticatedPeerLink,
+            allowTimelyAlert: allowTimelyAlert
         ) else { return false }
         let plan = context.plan
         let connectedStates = context.connectedStates
@@ -2500,10 +2648,13 @@ final class BLEService: NSObject {
             guard !plan.selectedLinks.peripheralIDs.isEmpty || !plan.selectedLinks.centralIDs.isEmpty else {
                 return false
             }
-            let alertTargets = context.subscribedCentrals.filter {
-                context.alertOnlyCentralIDs.contains($0.identifier.uuidString)
+            let alertTargets = context.subscribedCentrals.filter { central in
+                let centralID = central.identifier.uuidString
+                return plan.selectedLinks.centralIDs.contains(centralID)
+                    && context.alertOnlyCentralIDs.contains(centralID)
             }
             if !alertTargets.isEmpty,
+               allowTimelyAlert,
                BLEOutboundPacketPolicy.isTimelyAlertCandidate(packet),
                let alertCharacteristic {
                 _ = notifyOrEnqueueIfAccepted(
@@ -2528,7 +2679,11 @@ final class BLEService: NSObject {
         // If directed and we currently have no links to forward on, spool for a short window
         if let only = plan.directedPeerHint,
            plan.shouldSpoolDirectedPacket {
-            spoolDirectedPacket(packet, recipientPeerID: only)
+            spoolDirectedPacket(
+                packet,
+                recipientPeerID: only,
+                timelyAlertEligible: allowTimelyAlert
+            )
         }
 
         var acceptedByPhysicalLink = false
@@ -2554,14 +2709,18 @@ final class BLEService: NSObject {
         // Notify selected subscribed centrals. A foreground watch receives the
         // normal mesh lane; a lowered-wrist watch receives message-bearing
         // packets only on the alert lane, never both.
-        let selectedTargets = subscribedCentrals.filter {
-            plan.selectedLinks.centralIDs.contains($0.identifier.uuidString)
-        }
-        let primaryTargets = selectedTargets.filter {
-            context.primaryCentralIDs.contains($0.identifier.uuidString)
-        }
-        let alertTargets = selectedTargets.filter {
-            context.alertOnlyCentralIDs.contains($0.identifier.uuidString)
+        var primaryTargets: [CBCentral] = []
+        var alertTargets: [CBCentral] = []
+        primaryTargets.reserveCapacity(plan.selectedLinks.centralIDs.count)
+        alertTargets.reserveCapacity(plan.selectedLinks.centralIDs.count)
+        for central in subscribedCentrals {
+            let centralID = central.identifier.uuidString
+            guard plan.selectedLinks.centralIDs.contains(centralID) else { continue }
+            if context.primaryCentralIDs.contains(centralID) {
+                primaryTargets.append(central)
+            } else if context.alertOnlyCentralIDs.contains(centralID) {
+                alertTargets.append(central)
+            }
         }
         if let ch = characteristic, !primaryTargets.isEmpty {
             if requireDirectPeerLink || requireNoiseAuthenticatedPeerLink {
@@ -2637,7 +2796,11 @@ final class BLEService: NSObject {
     }
 
     // MARK: - Directed store-and-forward
-    private func spoolDirectedPacket(_ packet: BitchatPacket, recipientPeerID: PeerID) {
+    private func spoolDirectedPacket(
+        _ packet: BitchatPacket,
+        recipientPeerID: PeerID,
+        timelyAlertEligible: Bool = true
+    ) {
         let msgID = BLEOutboundPacketPolicy.messageID(for: packet)
         messageQueue.async { [weak self] in
             guard let self = self else { return }
@@ -2645,7 +2808,8 @@ final class BLEService: NSObject {
                 packet: packet,
                 recipient: recipientPeerID,
                 messageID: msgID,
-                enqueuedAt: Date()
+                enqueuedAt: Date(),
+                timelyAlertEligible: timelyAlertEligible
             ) {
                 SecureLogger.debug("🧳 Spooling directed packet for \(recipientPeerID) mid=\(msgID.prefix(8))…", category: .session)
             }
@@ -2655,16 +2819,34 @@ final class BLEService: NSObject {
     func flushDirectedSpool() {
         guard !isPanicSuspended else { return }
         // Runs from bleQueue maintenance: hop to the engine asynchronously
-        // (bleQueue must never sync-wait on the engine). Move items out and
-        // attempt broadcast; if still no links, they'll be re-spooled.
+        // (bleQueue must never sync-wait on the engine). Leave packets with
+        // no eligible route in place so retries preserve their expiry and a
+        // successfully queued wake signal waits for the mesh lane to reopen.
         messageQueue.async { [weak self] in
             guard let self, !self.isPanicSuspended else { return }
             let toSend = self.pendingDirectedRelays.drainUnexpired(
                 now: Date(),
-                window: TransportConfig.bleDirectedSpoolWindowSeconds
+                window: TransportConfig.bleDirectedSpoolWindowSeconds,
+                shouldDrain: { entry in
+                    guard let data = entry.packet.toBinaryData(
+                        padding: BLEOutboundPacketPolicy.padsBLEFrame(for: entry.packet.type)
+                    ), let context = self.outboundLinkPlanningContext(
+                        packet: entry.packet,
+                        dataCount: data.count,
+                        directedOnlyPeer: entry.recipient,
+                        requireDirectPeerLink: false,
+                        requireNoiseAuthenticatedPeerLink: false,
+                        allowTimelyAlert: entry.timelyAlertEligible
+                    ) else { return false }
+                    return !context.plan.selectedLinks.peripheralIDs.isEmpty
+                        || !context.plan.selectedLinks.centralIDs.isEmpty
+                }
             )
             for entry in toSend {
-                self.broadcastPacket(entry.packet)
+                self.broadcastPacket(
+                    entry.packet,
+                    allowTimelyAlert: entry.timelyAlertEligible
+                )
             }
         }
     }
@@ -2889,7 +3071,16 @@ final class BLEService: NSObject {
         }
         
         SecureLogger.debug("📤 Sending favorite notification to \(peerID.id.prefix(8))… isFavorite=\(isFavorite) includesNostrIdentity=\(includesNostrIdentity)", category: .session)
-        sendPrivateMessage(content, to: peerID, messageID: UUID().uuidString)
+        guard let payload = BLENoisePayloadFactory.privateMessage(
+            content: content,
+            messageID: UUID().uuidString
+        ) else {
+            SecureLogger.error("Failed to encode favorite notification with TLV")
+            return
+        }
+        // Favorites synchronize relationship state; they are not a user-
+        // visible incoming DM and must not spend a scarce watch timely alert.
+        sendNoisePayload(payload, to: peerID)
     }
     
     func sendBroadcastAnnounce() {
@@ -2910,7 +3101,10 @@ final class BLEService: NSObject {
 
         if noiseService.hasEstablishedSession(with: peerID) {
             do {
-                broadcastPacket(try makeEncryptedNoisePacket(payload, to: peerID))
+                broadcastPacket(
+                    try makeEncryptedNoisePacket(payload, to: peerID),
+                    allowTimelyAlert: false
+                )
             } catch {
                 SecureLogger.error("Failed to send delivery ACK: \(error)")
             }
@@ -3122,7 +3316,10 @@ final class BLEService: NSObject {
             }
             do {
                 let typedPayload = NoisePayload(type: .voiceFrame, data: burstContent).encode()
-                self.broadcastPacket(try self.makeEncryptedNoisePacket(typedPayload, to: peerID))
+                self.broadcastPacket(
+                    try self.makeEncryptedNoisePacket(typedPayload, to: peerID),
+                    allowTimelyAlert: false
+                )
             } catch {
                 SecureLogger.error("Failed to send voice frame: \(error)", category: .session)
             }
@@ -3256,6 +3453,45 @@ extension BLEService: BLERadioControllerDelegate {
         linkBindings.bindPeripheral(peripheralUUID, to: peerID)
     }
 
+    /// Engine-confined central binding transition. Persisting a routing hint
+    /// lets a restored alert-only watch receive the Noise handshake that
+    /// re-authenticates the link after an iOS process relaunch.
+    func bindCentralLink(_ centralUUID: String, to peerID: PeerID) {
+        linkBindings.bindCentral(centralUUID, to: peerID)
+        centralPeerRestorationHints.remember(
+            centralUUID: centralUUID,
+            peerID: peerID
+        )
+    }
+
+    /// Called from the Bluetooth delegate queue after physical subscriber
+    /// restoration. Identity ownership stays on the engine queue, and only
+    /// currently restored central UUIDs may recover hints. Noise proof is
+    /// intentionally not restored.
+    func restoreCentralLinkBindingHints(forCentralUUIDs centralUUIDs: [String]) {
+        let hints = centralPeerRestorationHints.hints(for: centralUUIDs)
+        guard !hints.isEmpty else { return }
+        messageQueue.async { [weak self] in
+            guard let self else { return }
+            let liveCentralIDs = self.readLinkState { store in
+                Set(store.allSubscribedCentrals.map { $0.identifier.uuidString })
+            }
+            var restoredCount = 0
+            for (centralUUID, peerID) in hints
+            where liveCentralIDs.contains(centralUUID)
+                    && self.linkBindings.peer(forCentralUUID: centralUUID) == nil {
+                self.linkBindings.bindCentral(centralUUID, to: peerID)
+                restoredCount += 1
+            }
+            if restoredCount > 0 {
+                SecureLogger.info(
+                    "♻️ Restored \(restoredCount) central routing hint(s); Noise re-authentication required",
+                    category: .session
+                )
+            }
+        }
+    }
+
     /// Whether the peer holds a live direct link in either role: bindings
     /// (engine) joined against physical liveness (readLinkState).
     /// Engine-confined.
@@ -3268,31 +3504,6 @@ extension BLEService: BLERadioControllerDelegate {
         )
     }
 
-    /// The peer's preferred peripheral link state, when physically present.
-    /// Engine-confined.
-    func directPeripheralState(for peerID: PeerID) -> BLEPeripheralLinkState? {
-        linkBindings.preferredPeripheralUUID(for: peerID)
-            .flatMap { uuid in readLinkState { $0.state(forPeripheralID: uuid) } }
-    }
-
-    /// Subscribed centrals with their bindings, one view. Engine-confined.
-    func subscribedCentralSnapshot() -> BLESubscribedCentralSnapshot {
-        let physical = readLinkState { store in
-            (
-                all: store.allSubscribedCentrals,
-                primary: Set(store.subscribedCentrals.map { $0.identifier.uuidString }),
-                alertOnly: Set(store.alertOnlySubscribedCentrals.map {
-                    $0.identifier.uuidString
-                })
-            )
-        }
-        return BLESubscribedCentralSnapshot(
-            centrals: physical.all,
-            peerIDsByCentralUUID: linkBindings.centralPeersByUUID,
-            primaryCentralIDs: physical.primary,
-            alertOnlyCentralIDs: physical.alertOnly
-        )
-    }
 }
 
 
@@ -4631,7 +4842,10 @@ extension BLEService {
             return
         }
         do {
-            broadcastPacket(try makeEncryptedNoisePacket(typedPayload, to: peerID))
+            broadcastPacket(
+                try makeEncryptedNoisePacket(typedPayload, to: peerID),
+                allowTimelyAlert: false
+            )
         } catch {
             SecureLogger.error("Failed to send verification payload: \(error)")
         }
@@ -5298,16 +5512,38 @@ extension BLEService {
         }
     }
 
-    private func snapshotDirectPeripheralState(for peerID: PeerID) -> BLEPeripheralLinkState? {
-        directPeripheralState(for: peerID)
-    }
-
-    private func snapshotPeripheralStates() -> [BLEPeripheralLinkState] {
-        readLinkState(\.peripheralStates)
-    }
-
-    private func snapshotSubscribedCentrals() -> BLESubscribedCentralSnapshot {
-        subscribedCentralSnapshot()
+    private func snapshotOutboundPhysicalLinks() -> BLEOutboundPhysicalLinkSnapshot {
+        let physical = readLinkState { store in
+            let primaryCentrals = store.subscribedCentrals
+            let primaryCentralIDs = Set(primaryCentrals.map { $0.identifier.uuidString })
+            var allCentrals = primaryCentrals
+            var alertOnlyCentralIDs = Set<String>()
+            allCentrals.reserveCapacity(
+                primaryCentrals.count + store.alertSubscribedCentrals.count
+            )
+            alertOnlyCentralIDs.reserveCapacity(store.alertSubscribedCentrals.count)
+            for central in store.alertSubscribedCentrals {
+                let centralID = central.identifier.uuidString
+                guard !primaryCentralIDs.contains(centralID) else { continue }
+                allCentrals.append(central)
+                alertOnlyCentralIDs.insert(centralID)
+            }
+            return (
+                peripheralStatesByID: store.peripherals,
+                centrals: allCentrals,
+                primaryCentralIDs: primaryCentralIDs,
+                alertOnlyCentralIDs: alertOnlyCentralIDs
+            )
+        }
+        return BLEOutboundPhysicalLinkSnapshot(
+            peripheralStatesByID: physical.peripheralStatesByID,
+            subscribedCentrals: BLESubscribedCentralSnapshot(
+                centrals: physical.centrals,
+                peerIDsByCentralUUID: linkBindings.centralPeersByUUID,
+                primaryCentralIDs: physical.primaryCentralIDs,
+                alertOnlyCentralIDs: physical.alertOnlyCentralIDs
+            )
+        )
     }
     
     // MARK: Helpers: IDs, selection, and write backpressure
@@ -5429,6 +5665,7 @@ extension BLEService {
 
     /// Periodically try to drain pending notifications as a backup mechanism
     private func drainPendingNotificationsIfPossible() {
+        drainPendingAlertNotifications(logPrefix: "🔄 Periodic alert drain: sent")
         drainPendingNotifications(logPrefix: "🔄 Periodic drain: sent")
     }
 
@@ -6113,7 +6350,7 @@ extension BLEService {
                 case .peripheral(let peripheralUUID):
                     bindPeripheralLink(peripheralUUID, to: claimedSenderID)
                 case .central(let centralUUID):
-                    linkBindings.bindCentral(centralUUID, to: claimedSenderID)
+                    bindCentralLink(centralUUID, to: claimedSenderID)
                 }
                 refreshLocalTopology()
             }
@@ -6480,7 +6717,7 @@ extension BLEService {
         case .peripheral(let peripheralUUID):
             bindPeripheralLink(peripheralUUID, to: peerID)
         case .central(let centralUUID):
-            linkBindings.bindCentral(centralUUID, to: peerID)
+            bindCentralLink(centralUUID, to: peerID)
         }
         // Same engine slot as the rebind: no observer may see the new
         // binding while a cached peer-level sender is still considered
@@ -7195,7 +7432,8 @@ extension BLEService {
                 broadcastPacket(
                     packet,
                     transferId: pending.transferId,
-                    requiresPrivateMediaAdmission: privateMediaTransferId != nil
+                    requiresPrivateMediaAdmission: privateMediaTransferId != nil,
+                    allowTimelyAlert: false
                 )
             } catch {
                 SecureLogger.error("❌ Failed to send pending noise payload to \(peerID.id.prefix(8))…: \(error)")

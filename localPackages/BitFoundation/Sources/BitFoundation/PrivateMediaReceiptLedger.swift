@@ -10,8 +10,11 @@ public enum PrivateMediaReceiptLedgerState: Equatable {
 /// A bounded durable receiver decision for stable private-media IDs.
 ///
 /// Accepted records retain a relative payload path and remain live while that
-/// payload exists. Tombstones expire after the retry horizon. Corrupt or
-/// unreadable state fails closed so a retry cannot double-deliver media.
+/// payload exists. Tombstones and accepted records have independent bounds so
+/// accepted traffic cannot evict explicit deletion intent. A tombstone retains
+/// its payload path until unlink succeeds, then expires after the retry horizon.
+/// Corrupt or unreadable state fails closed so a retry cannot double-deliver
+/// media.
 public final class PrivateMediaReceiptLedger: @unchecked Sendable {
     private static let currentVersion = 1
     private static let fileName = ".private-media-receipts-v1.json"
@@ -37,6 +40,7 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
     private let capacity: Int
     private let ttl: TimeInterval
     private let now: () -> Date
+    private let payloadRemover: (URL) throws -> Void
     private let lock = NSLock()
     private var records: [String: Record]?
 
@@ -45,7 +49,8 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
         baseDirectory: URL? = nil,
         capacity: Int = 4_096,
         ttl: TimeInterval = 7 * 24 * 60 * 60,
-        now: @escaping () -> Date = Date.init
+        now: @escaping () -> Date = Date.init,
+        payloadRemover: ((URL) throws -> Void)? = nil
     ) {
         self.fileManager = fileManager
         self.baseDirectory = baseDirectory ?? fileManager.urls(
@@ -55,6 +60,9 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
         self.capacity = max(1, capacity)
         self.ttl = max(0, ttl)
         self.now = now
+        self.payloadRemover = payloadRemover ?? {
+            try fileManager.removeItem(at: $0)
+        }
     }
 
     public func state(for messageID: String) -> PrivateMediaReceiptLedgerState {
@@ -65,13 +73,22 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard var current = loadIfNeeded(),
-              let record = current[messageID] else {
+              var record = current[messageID] else {
             return records == nil ? .unavailable : .absent
         }
 
         switch record.kind {
         case .tombstone:
-            guard !isExpired(record, at: now()) else {
+            if record.relativePath != nil {
+                _ = retryPendingPayloadRemoval(
+                    messageID: messageID,
+                    in: &current
+                )
+                record = current[messageID] ?? record
+            }
+            // Never age out deletion intent while its payload path still
+            // needs cleanup; doing so would leave an untracked orphan.
+            guard record.relativePath != nil || !isExpired(record, at: now()) else {
                 current.removeValue(forKey: messageID)
                 guard persist(current) else { return .tombstoned }
                 records = current
@@ -117,26 +134,51 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard var current = loadIfNeeded() else { return false }
-        pruneExpiredTombstones(in: &current, at: now())
 
-        if let existing = current[messageID] {
-            guard existing.kind == .accepted,
-                  existing.relativePath == relativePath else {
-                return false
-            }
-            return true
+        // Conversation restoration replays every live attachment through this
+        // method. Resolve the common idempotent case before the ledger-wide
+        // expiry scan so migration stays O(messages), not O(messages*ledger).
+        if let existing = current[messageID],
+           existing.kind == .accepted {
+            return existing.relativePath == relativePath
         }
+        let date = now()
+        pruneExpiredTombstones(in: &current, at: date)
+
+        guard current[messageID] == nil else { return false }
         guard !current.contains(where: {
             $0.key != messageID && $0.value.relativePath == relativePath
         }) else {
             return false
         }
-        guard makeCapacityForInsert(in: &current) else { return false }
+        if !hasCapacity(
+            for: .accepted,
+            replacing: messageID,
+            in: current
+        ) {
+            // Retention can unlink attachments after their conversation rows
+            // have been trimmed. Reclaim those missing payloads at capacity;
+            // waiting for a replay of each old ID eventually blocks all new
+            // private media. Keep live owners and deletion decisions intact.
+            let missing = current.compactMap { id, record -> String? in
+                guard record.kind == .accepted,
+                      let path = record.relativePath,
+                      let url = containedURL(for: path),
+                      !fileManager.fileExists(atPath: url.path) else { return nil }
+                return id
+            }
+            for id in missing { current.removeValue(forKey: id) }
+            guard hasCapacity(
+                for: .accepted,
+                replacing: messageID,
+                in: current
+            ) else { return false }
+        }
 
         current[messageID] = Record(
             kind: .accepted,
             relativePath: relativePath,
-            recordedAt: now()
+            recordedAt: date
         )
         guard persist(current) else { return false }
         records = current
@@ -153,22 +195,31 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard var current = loadIfNeeded() else { return false }
-        pruneExpiredTombstones(in: &current, at: now())
+        let date = now()
+        pruneExpiredTombstones(in: &current, at: date)
 
-        let acceptedURL = current[messageID]?.relativePath.flatMap(containedURL)
-        if current[messageID] == nil,
-           !makeCapacityForInsert(in: &current) {
-            return false
-        }
+        guard hasCapacity(
+            for: .tombstone,
+            replacing: messageID,
+            in: current
+        ) else { return false }
+
+        // This path is the durable unlink journal. Re-recording a pending
+        // tombstone must retain it rather than turning a failed unlink into an
+        // untracked payload.
+        let pendingRelativePath = current[messageID]?.relativePath
         current[messageID] = Record(
             kind: .tombstone,
-            relativePath: nil,
-            recordedAt: now()
+            relativePath: pendingRelativePath,
+            recordedAt: date
         )
         guard persist(current) else { return false }
         records = current
-        if let acceptedURL {
-            try? fileManager.removeItem(at: acceptedURL)
+        if pendingRelativePath != nil {
+            _ = retryPendingPayloadRemoval(
+                messageID: messageID,
+                in: &current
+            )
         }
         return true
     }
@@ -186,8 +237,7 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
             guard snapshot.version == Self.currentVersion,
                   snapshot.records.allSatisfy({ messageID, record in
                       PrivateMediaMessageIdentity.isStableID(messageID)
-                          && ((record.kind == .accepted && record.relativePath != nil)
-                              || (record.kind == .tombstone && record.relativePath == nil))
+                          && isStructurallyValid(record)
                   }) else {
                 return nil
             }
@@ -257,8 +307,17 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
         in candidate: inout [String: Record],
         at date: Date
     ) {
-        candidate = candidate.filter {
-            $0.value.kind != .tombstone || !isExpired($0.value, at: date)
+        // Collect only the keys that will be removed instead of allocating a
+        // replacement dictionary for every insertion.
+        let expiredMessageIDs = candidate.compactMap { messageID, record in
+            record.kind == .tombstone
+                && record.relativePath == nil
+                && isExpired(record, at: date)
+                ? messageID
+                : nil
+        }
+        for messageID in expiredMessageIDs {
+            candidate.removeValue(forKey: messageID)
         }
     }
 
@@ -266,16 +325,75 @@ public final class PrivateMediaReceiptLedger: @unchecked Sendable {
         date.timeIntervalSince(record.recordedAt) > ttl
     }
 
-    private func makeCapacityForInsert(
+    private func hasCapacity(
+        for kind: Record.Kind,
+        replacing messageID: String,
+        in candidate: [String: Record]
+    ) -> Bool {
+        guard candidate[messageID]?.kind != kind else { return true }
+        var matchingCount = 0
+        for record in candidate.values where record.kind == kind {
+            matchingCount += 1
+            if matchingCount >= capacity { return false }
+        }
+        return true
+    }
+
+    private func isStructurallyValid(_ record: Record) -> Bool {
+        switch record.kind {
+        case .accepted:
+            guard let relativePath = record.relativePath else { return false }
+            return containedURL(for: relativePath) != nil
+        case .tombstone:
+            guard let relativePath = record.relativePath else { return true }
+            return containedURL(for: relativePath) != nil
+        }
+    }
+
+    /// Retries a pathful tombstone and retires its payload path only after the
+    /// unlink is verified. A failure leaves both the durable and cached record
+    /// pathful so a later lookup or relaunch can retry safely.
+    @discardableResult
+    private func retryPendingPayloadRemoval(
+        messageID: String,
         in candidate: inout [String: Record]
     ) -> Bool {
-        guard candidate.count >= capacity else { return true }
-        guard let victim = candidate
-            .filter({ $0.value.kind == .tombstone })
-            .min(by: { $0.value.recordedAt < $1.value.recordedAt })?.key else {
+        guard let record = candidate[messageID],
+              record.kind == .tombstone,
+              let relativePath = record.relativePath,
+              let payloadURL = containedURL(for: relativePath) else {
+            return true
+        }
+
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(
+            atPath: payloadURL.path,
+            isDirectory: &isDirectory
+        ) {
+            // FileManager.removeItem recursively deletes directories. A
+            // corrupt ledger must never turn this cleanup into a tree removal.
+            guard !isDirectory.boolValue else { return false }
+            do {
+                try payloadRemover(payloadURL)
+            } catch {
+                return false
+            }
+            guard !fileManager.fileExists(atPath: payloadURL.path) else {
+                return false
+            }
+        }
+
+        let completedRecord = Record(
+            kind: .tombstone,
+            relativePath: nil,
+            recordedAt: record.recordedAt
+        )
+        candidate[messageID] = completedRecord
+        guard persist(candidate) else {
+            candidate[messageID] = record
             return false
         }
-        candidate.removeValue(forKey: victim)
+        records = candidate
         return true
     }
 }

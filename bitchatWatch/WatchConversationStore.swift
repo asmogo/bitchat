@@ -47,11 +47,23 @@ final class WatchConversationStore {
 
     func load() -> WatchConversationSnapshot {
         guard let data = try? Data(contentsOf: fileURL),
-              let snapshot = try? JSONDecoder().decode(
+              var snapshot = try? JSONDecoder().decode(
                 WatchConversationSnapshot.self,
                 from: data
               ) else {
             return .empty
+        }
+        if let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first {
+            func restore(_ message: WatchChatMessage) -> WatchChatMessage {
+                var message = message
+                message.media = message.media?.restored(in: documents)
+                return message
+            }
+            snapshot.messages = snapshot.messages.map(restore)
+            snapshot.privateMessages = snapshot.privateMessages.mapValues { $0.map(restore) }
         }
         return snapshot
     }

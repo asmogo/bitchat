@@ -35,15 +35,15 @@ final class WatchNoiseManager {
     /// still decrypt while the replacement handshake completes — the watch
     /// equivalent of iOS's quarantined rollback state.
     private var quarantined: [PeerID: NoiseSession] = [:]
+    /// Message 1 must be retransmitted verbatim while an initiator handshake
+    /// is in flight. Starting a second Noise session would create a different
+    /// transcript and make a delayed message 2 unusable.
+    private var cachedInitiations: [PeerID: Data] = [:]
     private var lastMessageOne: [PeerID: Data] = [:]
     private var cachedMessageTwo: [PeerID: Data] = [:]
 
     init(identity: WatchIdentity) {
         self.identity = identity
-    }
-
-    func hasSession(with peerID: PeerID) -> Bool {
-        sessions[peerID] != nil
     }
 
     func isEstablished(with peerID: PeerID) -> Bool {
@@ -52,13 +52,25 @@ final class WatchNoiseManager {
 
     func initiate(with peerID: PeerID) throws -> Data? {
         if let session = sessions[peerID] {
-            if session.isEstablished() || session.getState() == .handshaking {
+            if session.isEstablished() {
                 return nil
+            }
+            if session.getState() == .handshaking {
+                guard session.role == .initiator else { return nil }
+                return cachedInitiations[peerID]
             }
         }
         let session = makeSession(peerID: peerID, role: .initiator)
         sessions[peerID] = session
-        return try session.startHandshake()
+        do {
+            let initiation = try session.startHandshake()
+            cachedInitiations[peerID] = initiation
+            return initiation
+        } catch {
+            sessions.removeValue(forKey: peerID)?.reset()
+            cachedInitiations.removeValue(forKey: peerID)
+            throw error
+        }
     }
 
     func process(_ message: Data, from peerID: PeerID) throws -> WatchNoiseHandshakeResult {
@@ -90,6 +102,7 @@ final class WatchNoiseManager {
             } else {
                 session?.reset()
             }
+            cachedInitiations.removeValue(forKey: peerID)
             session = makeSession(peerID: peerID, role: .responder)
             sessions[peerID] = session
         } else if let existing = session, existing.isEstablished() {
@@ -116,6 +129,7 @@ final class WatchNoiseManager {
                 throw WatchNoiseError.peerIdentityMismatch
             }
             quarantined.removeValue(forKey: peerID)?.reset()
+            cachedInitiations.removeValue(forKey: peerID)
             lastMessageOne.removeValue(forKey: peerID)
             cachedMessageTwo.removeValue(forKey: peerID)
         }
@@ -142,21 +156,13 @@ final class WatchNoiseManager {
         return try session.encrypt(plaintext)
     }
 
-    func decrypt(_ ciphertext: Data, from peerID: PeerID) throws -> Data {
-        if let session = sessions[peerID], session.isEstablished(),
-           let plaintext = try? session.decrypt(ciphertext) {
-            return plaintext
-        }
-        guard let rollback = quarantined[peerID], rollback.isEstablished() else {
-            throw NoiseSessionError.notEstablished
-        }
-        return try rollback.decrypt(ciphertext)
-    }
-
+    /// A nil result means the packet must wait for the active handshake.
+    /// Try retained receive keys first: deferring all traffic during a
+    /// replacement handshake loses old-generation packets when it completes.
     func decryptWithSession(
         _ ciphertext: Data,
         from peerID: PeerID
-    ) throws -> (plaintext: Data, session: WatchAuthenticatedNoiseSession) {
+    ) throws -> (plaintext: Data, session: WatchAuthenticatedNoiseSession)? {
         if let authenticated = authenticatedSession(for: peerID),
            let session = sessions[peerID], session.isEstablished(),
            let plaintext = try? session.decrypt(ciphertext) {
@@ -165,12 +171,13 @@ final class WatchNoiseManager {
             }
             return (plaintext, authenticated)
         }
-        guard let rollback = quarantined[peerID], rollback.isEstablished(),
-              let authenticated = authenticatedSession(rollback, for: peerID) else {
-            throw NoiseSessionError.notEstablished
+        if let rollback = quarantined[peerID],
+           let authenticated = authenticatedSession(rollback, for: peerID),
+           let plaintext = try? rollback.decrypt(ciphertext) {
+            return (plaintext, authenticated)
         }
-        let plaintext = try rollback.decrypt(ciphertext)
-        return (plaintext, authenticated)
+        if sessions[peerID]?.getState() == .handshaking { return nil }
+        throw NoiseSessionError.notEstablished
     }
 
     func authenticatedSession(for peerID: PeerID) -> WatchAuthenticatedNoiseSession? {
@@ -205,6 +212,7 @@ final class WatchNoiseManager {
     func clear(_ peerID: PeerID) {
         sessions.removeValue(forKey: peerID)?.reset()
         quarantined.removeValue(forKey: peerID)?.reset()
+        cachedInitiations.removeValue(forKey: peerID)
         lastMessageOne.removeValue(forKey: peerID)
         cachedMessageTwo.removeValue(forKey: peerID)
     }
@@ -214,6 +222,7 @@ final class WatchNoiseManager {
         sessions.removeAll()
         for session in quarantined.values { session.reset() }
         quarantined.removeAll()
+        cachedInitiations.removeAll()
         lastMessageOne.removeAll()
         cachedMessageTwo.removeAll()
     }

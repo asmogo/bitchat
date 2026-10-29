@@ -52,10 +52,29 @@ enum WatchNotifications {
     }
 
     static func shouldScheduleAlert(
-        isAppInForeground: Bool,
+        isAppInteractive: Bool,
         isConversationActive: Bool
     ) -> Bool {
-        !isAppInForeground || !isConversationActive
+        !isAppInteractive || !isConversationActive
+    }
+
+    static func authorizationSummary(completion: @escaping (String) -> Void) {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let summary: String
+            switch settings.authorizationStatus {
+            case .authorized, .provisional, .ephemeral:
+                summary = "enabled"
+            case .denied:
+                summary = "denied"
+            case .notDetermined:
+                summary = "not requested"
+            @unknown default:
+                summary = "unknown"
+            }
+            DispatchQueue.main.async {
+                completion(summary)
+            }
+        }
     }
 
     static func directMessageDescriptor(

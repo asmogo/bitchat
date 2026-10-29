@@ -8,6 +8,7 @@
 
 import SwiftUI
 import UserNotifications
+import WatchKit
 
 @main
 struct BitchatWatchApp: App {
@@ -15,7 +16,18 @@ struct BitchatWatchApp: App {
 
     init() {
         UNUserNotificationCenter.current().delegate = WatchNotificationDelegate.shared
-        _ble = StateObject(wrappedValue: WatchBLEController())
+        // Core Bluetooth restoration only works if the central manager is
+        // recreated during every process launch. A background Bluetooth
+        // relaunch does not have to present ContentView, so starting from the
+        // view's onAppear is too late (and sometimes never happens).
+        let controller = WatchBLEController()
+        let state = WKApplication.shared().applicationState
+        controller.setApplicationState(
+            isForeground: state != .background,
+            isInteractive: state == .active
+        )
+        controller.start()
+        _ble = StateObject(wrappedValue: controller)
     }
 
     var body: some Scene {

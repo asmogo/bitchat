@@ -1,4 +1,5 @@
 import BitFoundation
+import Foundation
 import Testing
 @testable import bitchat
 
@@ -107,5 +108,42 @@ struct BLELinkBindingsTests {
         #expect(removed == peerID)
         #expect(bindings.preferredPeripheralUUID(for: peerID) == nil)
         #expect(bindings.links(to: peerID).isEmpty)
+    }
+
+    @Test
+    func restorationHintsAreScopedExpiringRoutingHints() throws {
+        let suite = "ble-central-hints-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = BLECentralPeerRestorationHintStore(
+            defaults: defaults,
+            storageKey: "hints",
+            maximumAge: 60,
+            maximumEntries: 4
+        )
+        let now = Date(timeIntervalSince1970: 1_000)
+
+        store.remember(centralUUID: "central-a", peerID: peerID, at: now)
+        store.remember(
+            centralUUID: "central-b",
+            peerID: otherPeerID,
+            at: now.addingTimeInterval(1)
+        )
+
+        #expect(
+            store.hints(for: ["central-a"], at: now.addingTimeInterval(30))
+                == ["central-a": peerID]
+        )
+        #expect(
+            store.hints(for: ["central-a"], at: now.addingTimeInterval(61))
+                .isEmpty
+        )
+        #expect(
+            store.hints(for: ["central-b"], at: now.addingTimeInterval(61))
+                == ["central-b": otherPeerID]
+        )
+
+        store.remove(centralUUID: "central-b")
+        #expect(store.hints(for: ["central-b"], at: now).isEmpty)
     }
 }

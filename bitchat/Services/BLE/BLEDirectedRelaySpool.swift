@@ -4,6 +4,7 @@ import Foundation
 struct BLEDirectedRelaySpoolEntry {
     let recipient: PeerID
     let packet: BitchatPacket
+    let timelyAlertEligible: Bool
 }
 
 /// Directed packets held at a relay while no onward link exists.
@@ -24,6 +25,7 @@ struct BLEDirectedRelaySpool {
     private struct StoredPacket {
         let packet: BitchatPacket
         let enqueuedAt: Date
+        let timelyAlertEligible: Bool
     }
 
     private let capacity: Int
@@ -58,14 +60,19 @@ struct BLEDirectedRelaySpool {
         packet: BitchatPacket,
         recipient: PeerID,
         messageID: String,
-        enqueuedAt: Date
+        enqueuedAt: Date,
+        timelyAlertEligible: Bool = true
     ) -> Bool {
         let key = Key(recipient: recipient, messageID: messageID)
         guard packets[key] == nil, packet.payload.count <= byteBudget else {
             return false
         }
 
-        packets[key] = StoredPacket(packet: packet, enqueuedAt: enqueuedAt)
+        packets[key] = StoredPacket(
+            packet: packet,
+            enqueuedAt: enqueuedAt,
+            timelyAlertEligible: timelyAlertEligible
+        )
         order.append(key)
         payloadBytes += packet.payload.count
         while order.count > capacity || payloadBytes > byteBudget {
@@ -77,16 +84,34 @@ struct BLEDirectedRelaySpool {
         return true
     }
 
-    mutating func drainUnexpired(now: Date, window: TimeInterval) -> [BLEDirectedRelaySpoolEntry] {
+    mutating func drainUnexpired(
+        now: Date,
+        window: TimeInterval,
+        shouldDrain: (BLEDirectedRelaySpoolEntry) -> Bool = { _ in true }
+    ) -> [BLEDirectedRelaySpoolEntry] {
         var entries: [BLEDirectedRelaySpoolEntry] = []
-
+        entries.reserveCapacity(count)
+        var retainedOrder: [Key] = []
         for key in order {
-            guard let stored = packets[key],
-                  now.timeIntervalSince(stored.enqueuedAt) <= window else { continue }
-            entries.append(BLEDirectedRelaySpoolEntry(recipient: key.recipient, packet: stored.packet))
+            guard let stored = packets[key] else { continue }
+            if now.timeIntervalSince(stored.enqueuedAt) <= window {
+                let entry = BLEDirectedRelaySpoolEntry(
+                    recipient: key.recipient,
+                    packet: stored.packet,
+                    timelyAlertEligible: stored.timelyAlertEligible
+                )
+                if !shouldDrain(entry) {
+                    retainedOrder.append(key)
+                    continue
+                }
+                entries.append(entry)
+            }
+            packets.removeValue(forKey: key)
+            payloadBytes -= stored.packet.payload.count
         }
-
-        removeAll()
+        // Keep waiting packets in their original eviction order, with their
+        // original expiry and byte accounting intact across maintenance retries.
+        order = retainedOrder
         return entries
     }
 

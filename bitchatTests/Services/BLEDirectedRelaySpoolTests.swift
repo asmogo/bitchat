@@ -48,6 +48,92 @@ struct BLEDirectedRelaySpoolTests {
     }
 
     @Test
+    func unroutableRetriesPreserveOriginalExpiryAndAlertPolicy() {
+        let recipient = PeerID(str: "1122334455667788")
+        let start = Date(timeIntervalSince1970: 1_000)
+        var spool = BLEDirectedRelaySpool()
+        spool.enqueue(
+            packet: makePacket(payload: [0x01]), recipient: recipient,
+            messageID: "waiting-for-mesh", enqueuedAt: start,
+            timelyAlertEligible: false
+        )
+        for offset in 1...5 {
+            let drained = spool.drainUnexpired(
+                now: start.addingTimeInterval(Double(offset)), window: 5,
+                shouldDrain: { entry in
+                    #expect(!entry.timelyAlertEligible)
+                    return false
+                }
+            )
+            #expect(drained.isEmpty)
+            #expect(spool.count == 1)
+        }
+        #expect(spool.drainUnexpired(
+            now: start.addingTimeInterval(6), window: 5
+        ).isEmpty)
+        #expect(spool.isEmpty)
+    }
+
+    @Test
+    func selectiveDrainKeepsWaitingPacketsUntilTheirLinkIsReady() {
+        let recipient = PeerID(str: "1122334455667788")
+        let now = Date()
+        var spool = BLEDirectedRelaySpool()
+        spool.enqueue(packet: makePacket(payload: [1]), recipient: recipient,
+                      messageID: "ready", enqueuedAt: now)
+        spool.enqueue(packet: makePacket(payload: [2]), recipient: recipient,
+                      messageID: "waiting", enqueuedAt: now)
+
+        let ready = spool.drainUnexpired(now: now, window: 5) {
+            $0.packet.payload == Data([1])
+        }
+        #expect(ready.map(\.packet.payload) == [Data([1])])
+        #expect(spool.count == 1)
+        let resumed = spool.drainUnexpired(now: now.addingTimeInterval(1), window: 5)
+        #expect(resumed.map(\.packet.payload) == [Data([2])])
+        #expect(spool.isEmpty)
+    }
+
+    @Test
+    func drainPreservesTimelyAlertEligibility() {
+        let recipient = PeerID(str: "1122334455667788")
+        let now = Date()
+        var spool = BLEDirectedRelaySpool()
+
+        spool.enqueue(
+            packet: makePacket(payload: [0x01]),
+            recipient: recipient,
+            messageID: "control-payload",
+            enqueuedAt: now,
+            timelyAlertEligible: false
+        )
+
+        let drained = spool.drainUnexpired(now: now, window: 5)
+
+        #expect(drained.count == 1)
+        #expect(drained.first?.timelyAlertEligible == false)
+    }
+
+    @Test
+    func drainIncludesPacketExactlyAtExpiryBoundary() {
+        let recipient = PeerID(str: "1122334455667788")
+        let now = Date(timeIntervalSince1970: 1_000)
+        var spool = BLEDirectedRelaySpool()
+
+        spool.enqueue(
+            packet: makePacket(payload: [0x01]),
+            recipient: recipient,
+            messageID: "boundary",
+            enqueuedAt: now.addingTimeInterval(-5)
+        )
+
+        let drained = spool.drainUnexpired(now: now, window: 5)
+
+        #expect(drained.count == 1)
+        #expect(drained.first?.recipient == recipient)
+    }
+
+    @Test
     func pruneExpiredKeepsFreshPacketsAcrossRecipients() {
         let firstRecipient = PeerID(str: "1122334455667788")
         let secondRecipient = PeerID(str: "8877665544332211")

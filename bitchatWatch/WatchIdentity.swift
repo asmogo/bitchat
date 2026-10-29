@@ -139,25 +139,41 @@ final class WatchIdentity: KeychainManagerProtocol {
     private static let keychainService = "chat.bitchat.watch.identity"
     private static let nicknameAccount = "profile_nickname"
 
-    private struct KeyLoadResult {
-        let data: Data
-        let isPersistent: Bool
-    }
-
     private static func loadOrCreateKey(
         account: String,
         create: () -> Data,
         isValid: (Data) -> Bool
-    ) -> KeyLoadResult {
-        if let data = load(account: account), isValid(data) {
-            return KeyLoadResult(data: data, isPersistent: true)
+    ) -> (data: Data, isPersistent: Bool) {
+        let result = loadOrCreateKey(
+            read: readResult(account: account, service: keychainService),
+            create: create,
+            isValid: isValid,
+            persist: { save(account: account, data: $0) }
+        )
+        if !result.isPersistent {
+            logger.error("Secure identity key unavailable: \(account, privacy: .public)")
         }
-        let data = create()
-        let status = save(account: account, data: data)
-        if status != errSecSuccess {
-            logger.error("Failed to persist identity key: \(status, privacy: .public)")
+        return result
+    }
+
+    /// Only a confirmed missing item permits identity creation. Read errors
+    /// (including a locked keychain) must never become writes that replace
+    /// the user's existing identity if access recovers between the two calls.
+    static func loadOrCreateKey(
+        read: KeychainReadResult,
+        create: () -> Data,
+        isValid: (Data) -> Bool,
+        persist: (Data) -> OSStatus
+    ) -> (data: Data, isPersistent: Bool) {
+        switch read {
+        case let .success(data) where isValid(data):
+            return (data, true)
+        case .itemNotFound:
+            let data = create()
+            return (data, persist(data) == errSecSuccess)
+        default:
+            return (Data(), false)
         }
-        return KeyLoadResult(data: data, isPersistent: status == errSecSuccess)
     }
 
     private static func load(account: String, service: String = keychainService) -> Data? {

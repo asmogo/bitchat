@@ -618,7 +618,6 @@ final class WatchFragmentAssembler {
         var originalType: UInt8
         var parts: [Int: Data]
         var byteCount: Int
-        var createdAt: Date
         var lastNewPartAt: Date
         var lastResyncAt: Date?
         var isBroadcast: Bool
@@ -631,26 +630,27 @@ final class WatchFragmentAssembler {
     // from many transfers; evicting an active set makes every stream thrash.
     private let maxInFlightAssemblies = 64
 
-    func append(_ header: WatchFragmentHeader) -> AppendResult {
+    func append(_ header: WatchFragmentHeader, now: Date = Date()) -> AppendResult {
         let key = Key(sender: header.sender, id: header.id)
         let started = buffers[key] == nil
         if started, buffers.count >= maxInFlightAssemblies {
             evictOldest(excluding: key)
         }
-        var buffer = buffers[key] ?? Buffer(
+        // Take ownership before mutating the nested parts dictionary. A
+        // borrowed copy forces every append to copy all previous fragments.
+        var buffer = buffers.removeValue(forKey: key) ?? Buffer(
             total: header.total,
             originalType: header.originalType,
             parts: [:],
             byteCount: 0,
-            createdAt: Date(),
-            lastNewPartAt: Date(),
+            lastNewPartAt: now,
             lastResyncAt: nil,
             isBroadcast: header.isBroadcast
         )
+        totalBufferedBytes -= buffer.byteCount
         guard buffer.total == header.total,
               buffer.originalType == header.originalType,
               buffer.isBroadcast == header.isBroadcast else {
-            removeBuffer(for: key)
             return .rejected(reason: "inconsistent fragment metadata")
         }
 
@@ -662,21 +662,20 @@ final class WatchFragmentAssembler {
         let grownBytes = header.data.count - replacedBytes
         let assemblyLimit = Self.assemblyLimit(for: header.originalType)
         guard buffer.byteCount + grownBytes <= assemblyLimit else {
-            removeBuffer(for: key)
             return .rejected(reason: "assembled payload exceeds \(assemblyLimit)B")
         }
-        while totalBufferedBytes + grownBytes > maxBufferedBytes,
+        let updatedByteCount = buffer.byteCount + grownBytes
+        while totalBufferedBytes + updatedByteCount > maxBufferedBytes,
               evictOldest(excluding: key) {}
-        guard totalBufferedBytes + grownBytes <= maxBufferedBytes else {
-            removeBuffer(for: key)
+        guard totalBufferedBytes + updatedByteCount <= maxBufferedBytes else {
             return .rejected(reason: "fragment buffer memory limit")
         }
 
         buffer.parts[header.index] = header.data
-        buffer.byteCount += grownBytes
-        totalBufferedBytes += grownBytes
+        buffer.byteCount = updatedByteCount
+        totalBufferedBytes += updatedByteCount
         if madeProgress {
-            buffer.lastNewPartAt = Date()
+            buffer.lastNewPartAt = now
         }
         buffers[key] = buffer
 
@@ -684,6 +683,7 @@ final class WatchFragmentAssembler {
             return .stored(received: buffer.parts.count, total: buffer.total, started: started)
         }
         var assembled = Data()
+        assembled.reserveCapacity(buffer.byteCount)
         for index in 0..<buffer.total {
             guard let part = buffer.parts[index] else {
                 removeBuffer(for: key)
@@ -728,10 +728,13 @@ final class WatchFragmentAssembler {
         }
     }
 
-    func expire(olderThan seconds: TimeInterval = 30) {
-        let cutoff = Date().addingTimeInterval(-seconds)
+    func expire(olderThan seconds: TimeInterval = 30, now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-seconds)
         let expired = buffers.compactMap { key, buffer in
-            buffer.createdAt <= cutoff ? key : nil
+            // Extended transfers can legitimately take minutes over BLE.
+            // Only new fragments refresh this deadline; duplicate traffic
+            // must not keep an abandoned assembly alive indefinitely.
+            buffer.lastNewPartAt <= cutoff ? key : nil
         }
         for key in expired {
             removeBuffer(for: key)

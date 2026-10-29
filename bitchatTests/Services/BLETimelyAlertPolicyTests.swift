@@ -5,27 +5,36 @@ import Testing
 
 @Suite("BLE timely alert policy")
 struct BLETimelyAlertPolicyTests {
-    @Test("only message-capable transport classes enter the watch alert lane")
-    func messageCapablePacketsOnly() {
-        let allowed: [MessageType] = [.message, .noiseEncrypted]
+    @Test("only directed encrypted traffic and handshakes enter the watch alert lane")
+    func directedNoisePacketsOnly() {
         let blocked: [MessageType] = [
-            .announce, .announceV2, .leave, .requestSync, .fragment,
+            .message, .announce, .announceV2, .leave, .requestSync, .fragment,
             .fileTransfer, .courierEnvelope, .boardPost, .ping, .pong,
-            .nostrCarrier, .prekeyBundle, .groupMessage, .voiceFrame,
-            .noiseHandshake
+            .nostrCarrier, .prekeyBundle, .groupMessage, .voiceFrame
         ]
 
-        #expect(allowed.allSatisfy {
-            BLEOutboundPacketPolicy.isTimelyAlertCandidate(packet(type: $0))
-        })
+        #expect(BLEOutboundPacketPolicy.isTimelyAlertCandidate(
+            packet(type: .noiseEncrypted, directed: true)
+        ))
+        #expect(BLEOutboundPacketPolicy.isTimelyAlertCandidate(
+            packet(type: .noiseHandshake, directed: true)
+        ))
+        #expect(!BLEOutboundPacketPolicy.isTimelyAlertCandidate(
+            packet(type: .noiseEncrypted, directed: false)
+        ))
+        #expect(!BLEOutboundPacketPolicy.isTimelyAlertCandidate(
+            packet(type: .noiseHandshake, directed: false)
+        ))
         #expect(blocked.allSatisfy {
-            !BLEOutboundPacketPolicy.isTimelyAlertCandidate(packet(type: $0))
+            !BLEOutboundPacketPolicy.isTimelyAlertCandidate(
+                packet(type: $0, directed: true)
+            )
         })
     }
 
     @Test("alert signals are compact and round-trip their message identity")
     func compactAlertSignal() throws {
-        let source = packet(type: .noiseEncrypted)
+        let source = packet(type: .noiseEncrypted, directed: true)
         let data = BLETimelyAlertSignal.encode(for: source)
         let decoded = try #require(BLETimelyAlertSignal.decode(data))
 
@@ -59,11 +68,11 @@ struct BLETimelyAlertPolicyTests {
         #expect(alertData.count < regularData.count)
     }
 
-    private func packet(type: MessageType) -> BitchatPacket {
+    private func packet(type: MessageType, directed: Bool = false) -> BitchatPacket {
         BitchatPacket(
             type: type.rawValue,
             senderID: Data(repeating: 1, count: 8),
-            recipientID: nil,
+            recipientID: directed ? Data(repeating: 2, count: 8) : nil,
             timestamp: 1,
             payload: Data(),
             signature: nil,

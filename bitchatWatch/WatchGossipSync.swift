@@ -7,6 +7,11 @@ import BitFoundation
 import CryptoKit
 import Foundation
 
+struct WatchSyncCandidate: Equatable {
+    let packetID: Data
+    let timestamp: UInt64
+}
+
 struct WatchSyncRequest {
     let p: Int
     let m: UInt32
@@ -64,14 +69,56 @@ struct WatchSyncRequest {
         )
     }
 
-    static func publicPayload(packetIDs: [Data]) -> Data {
+    static func publicPayload(packetIDs: [Data], sinceTimestamp: UInt64? = nil) -> Data {
         let parameters = WatchGCS.build(ids: packetIDs, maxBytes: 400, p: 7)
+        return publicPayload(parameters: parameters, sinceTimestamp: sinceTimestamp)
+    }
+
+    /// Builds a filter and an exact coverage cursor. When the 400-byte GCS
+    /// cannot hold every local ID, the cursor advances to the oldest packet
+    /// actually represented by the filter so responders do not resend the
+    /// uncovered tail forever.
+    static func publicPayload(
+        candidates: [WatchSyncCandidate],
+        minimumTimestamp: UInt64?
+    ) -> Data {
+        let parameters = WatchGCS.build(
+            ids: candidates.map(\.packetID),
+            maxBytes: 400,
+            p: 7
+        )
+        let coverageTimestamp: UInt64?
+        if parameters.includedCount > 0,
+           parameters.includedCount < candidates.count {
+            coverageTimestamp = candidates[parameters.includedCount - 1].timestamp
+        } else {
+            coverageTimestamp = nil
+        }
+        let sinceTimestamp = [minimumTimestamp, coverageTimestamp]
+            .compactMap { $0 }
+            .max()
+        return publicPayload(
+            parameters: parameters,
+            sinceTimestamp: sinceTimestamp
+        )
+    }
+
+    private static func publicPayload(
+        parameters: WatchGCS.Parameters,
+        sinceTimestamp: UInt64?
+    ) -> Data {
         var payload = Data()
         append(type: 0x01, value: Data([UInt8(parameters.p)]), to: &payload)
         var m = parameters.m.bigEndian
         append(type: 0x02, value: withUnsafeBytes(of: &m) { Data($0) }, to: &payload)
         append(type: 0x03, value: parameters.data, to: &payload)
         append(type: 0x04, value: Data([0x03]), to: &payload)
+        // The since-cursor tells servers which packets the filter covers;
+        // without it they re-send their entire window every round.
+        if let sinceTimestamp {
+            var since = sinceTimestamp.bigEndian
+            append(type: 0x05, value: withUnsafeBytes(of: &since) { Data($0) }, to: &payload)
+        }
         return payload
     }
 
@@ -106,9 +153,19 @@ struct WatchSyncRequest {
 }
 
 final class WatchGossipStore {
+    private struct StoredPacket {
+        let id: Data
+        let packet: BitchatPacket
+    }
+
     private struct OrderedStore {
         var packets: [Data: BitchatPacket] = [:]
         var order: [Data] = []
+        /// Logical start of `order`. Removing from an Array's front shifts
+        /// every retained ID, which made sustained fragment traffic O(n) per
+        /// eviction on the watch. Advance this cursor and compact only
+        /// occasionally so eviction stays amortized O(1).
+        var head = 0
 
         mutating func insert(_ packet: BitchatPacket, capacity: Int) {
             let id = WatchPacketID.compute(packet)
@@ -118,20 +175,29 @@ final class WatchGossipStore {
             }
             packets[id] = packet
             order.append(id)
-            while order.count > capacity {
-                packets.removeValue(forKey: order.removeFirst())
+            while order.count - head > capacity {
+                packets.removeValue(forKey: order[head])
+                head += 1
+            }
+            if head >= 64, head * 2 >= order.count {
+                order.removeFirst(head)
+                head = 0
             }
         }
 
-        func all() -> [BitchatPacket] {
-            order.compactMap { packets[$0] }
+        func all() -> [StoredPacket] {
+            guard head < order.count else { return [] }
+            return order[head...].compactMap { id in
+                packets[id].map { StoredPacket(id: id, packet: $0) }
+            }
         }
     }
 
-    private var announcements: [PeerID: BitchatPacket] = [:]
+    private var announcements: [PeerID: StoredPacket] = [:]
     private var messages = OrderedStore()
     private var fragments = OrderedStore()
     private var files = OrderedStore()
+    private let announcementCapacity = 128
     private let maximumAgeMilliseconds: UInt64 = 15 * 60 * 1_000
 
     func record(_ packet: BitchatPacket) {
@@ -140,7 +206,16 @@ final class WatchGossipStore {
               let type = MessageType(rawValue: packet.type) else { return }
         switch type {
         case .announce:
-            announcements[PeerID(hexData: packet.senderID)] = packet
+            announcements[PeerID(hexData: packet.senderID)] = StoredPacket(
+                id: WatchPacketID.compute(packet),
+                packet: packet
+            )
+            if announcements.count > announcementCapacity,
+               let oldest = announcements.min(by: {
+                   $0.value.packet.timestamp < $1.value.packet.timestamp
+               })?.key {
+                announcements.removeValue(forKey: oldest)
+            }
         case .message:
             messages.insert(packet, capacity: 500)
         case .fragment:
@@ -153,35 +228,49 @@ final class WatchGossipStore {
     }
 
     func publicPacketIDs(nowMilliseconds: UInt64) -> [Data] {
-        fresh(Array(announcements.values) + messages.all(), now: nowMilliseconds)
-            .sorted { $0.timestamp > $1.timestamp }
-            .map(WatchPacketID.compute)
+        publicSyncCandidates(nowMilliseconds: nowMilliseconds).map(\.packetID)
+    }
+
+    func publicSyncCandidates(nowMilliseconds: UInt64) -> [WatchSyncCandidate] {
+        pruneStaleAnnouncements(nowMilliseconds: nowMilliseconds)
+        let stored = Array(announcements.values) + messages.all()
+        return stored
+            .filter { isFresh($0.packet, now: nowMilliseconds) }
+            .sorted { $0.packet.timestamp > $1.packet.timestamp }
+            .map {
+                WatchSyncCandidate(
+                    packetID: $0.id,
+                    timestamp: $0.packet.timestamp
+                )
+            }
     }
 
     func missingPackets(
         for request: WatchSyncRequest,
         nowMilliseconds: UInt64
     ) -> [BitchatPacket] {
+        pruneStaleAnnouncements(nowMilliseconds: nowMilliseconds)
         let decoded = WatchGCS.decode(p: request.p, m: request.m, data: request.data)
-        func requesterMightHave(_ packet: BitchatPacket) -> Bool {
+        func requesterMightHave(_ stored: StoredPacket) -> Bool {
             let bucket = WatchGCS.bucket(
-                WatchPacketID.compute(packet),
+                stored.id,
                 modulus: request.m
             )
             return decoded.binarySearch(bucket)
         }
 
-        var candidates: [BitchatPacket] = []
+        var candidates: [StoredPacket] = []
         if request.requests(.announce) {
             candidates.append(contentsOf: announcements.values)
         }
         if request.requests(.message) {
-            candidates.append(contentsOf: messages.all().filter { packet in
-                request.sinceTimestamp.map { packet.timestamp >= $0 } ?? true
+            candidates.append(contentsOf: messages.all().filter { stored in
+                request.sinceTimestamp.map { stored.packet.timestamp >= $0 } ?? true
             })
         }
         if request.requests(.fragment) {
-            candidates.append(contentsOf: fragments.all().filter { packet in
+            candidates.append(contentsOf: fragments.all().filter { stored in
+                let packet = stored.packet
                 guard let filter = request.fragmentIDs else {
                     return request.sinceTimestamp.map { packet.timestamp >= $0 } ?? true
                 }
@@ -190,27 +279,32 @@ final class WatchGossipStore {
             })
         }
         if request.requests(.fileTransfer) {
-            candidates.append(contentsOf: files.all().filter { packet in
-                request.sinceTimestamp.map { packet.timestamp >= $0 } ?? true
+            candidates.append(contentsOf: files.all().filter { stored in
+                request.sinceTimestamp.map { stored.packet.timestamp >= $0 } ?? true
             })
         }
-        return fresh(candidates, now: nowMilliseconds)
+        return candidates
+            .filter { isFresh($0.packet, now: nowMilliseconds) }
             .filter { !requesterMightHave($0) }
             .prefix(128)
-            .map { packet in
-                var response = packet
+            .map { stored in
+                var response = stored.packet
                 response.ttl = 0
                 response.isRSR = true
                 return response
             }
     }
 
-    private func fresh(_ packets: [BitchatPacket], now: UInt64) -> [BitchatPacket] {
-        packets.filter { packet in
-            if packet.timestamp >= now {
-                return packet.timestamp - now <= maximumAgeMilliseconds
-            }
-            return now - packet.timestamp <= maximumAgeMilliseconds
+    private func isFresh(_ packet: BitchatPacket, now: UInt64) -> Bool {
+        if packet.timestamp >= now {
+            return packet.timestamp - now <= maximumAgeMilliseconds
+        }
+        return now - packet.timestamp <= maximumAgeMilliseconds
+    }
+
+    private func pruneStaleAnnouncements(nowMilliseconds: UInt64) {
+        announcements = announcements.filter {
+            isFresh($0.value.packet, now: nowMilliseconds)
         }
     }
 }
@@ -232,22 +326,35 @@ private enum WatchGCS {
         let p: Int
         let m: UInt32
         let data: Data
+        let includedCount: Int
     }
 
     static func build(ids: [Data], maxBytes: Int, p: Int) -> Parameters {
-        guard !ids.isEmpty else { return Parameters(p: p, m: 1, data: Data()) }
+        guard !ids.isEmpty else {
+            return Parameters(p: p, m: 1, data: Data(), includedCount: 0)
+        }
+        // Encoding may retry with several candidate counts. Hash each packet
+        // ID once; only the inexpensive modulus changes between attempts.
+        let hashes = ids.map(hashValue)
         var count = min(ids.count, max(1, maxBytes * 8 / (p + 2)))
         while count > 0 {
             let m64 = min(UInt64(UInt32.max), UInt64(count) << UInt64(p))
             let m = UInt32(max(1, m64))
-            let values = Array(Set(ids.prefix(count).map { bucket($0, modulus: m) })).sorted()
+            let values = Array(Set(hashes.prefix(count).map {
+                bucket($0, modulus: m)
+            })).sorted()
             let encoded = encode(values, p: p)
             if encoded.count <= maxBytes {
-                return Parameters(p: p, m: m, data: encoded)
+                return Parameters(
+                    p: p,
+                    m: m,
+                    data: encoded,
+                    includedCount: count
+                )
             }
             count = max(0, count * 9 / 10)
         }
-        return Parameters(p: p, m: 1, data: Data())
+        return Parameters(p: p, m: 1, data: Data(), includedCount: 0)
     }
 
     static func decode(p: Int, m: UInt32, data: Data) -> [UInt64] {
@@ -266,10 +373,18 @@ private enum WatchGCS {
 
     static func bucket(_ id: Data, modulus: UInt32) -> UInt64 {
         guard modulus > 1 else { return 0 }
+        return bucket(hashValue(id), modulus: modulus)
+    }
+
+    private static func hashValue(_ id: Data) -> UInt64 {
         let digest = SHA256.hash(data: id)
         var value: UInt64 = 0
         for byte in digest.prefix(8) { value = (value << 8) | UInt64(byte) }
-        value &= 0x7fff_ffff_ffff_ffff
+        return value & 0x7fff_ffff_ffff_ffff
+    }
+
+    private static func bucket(_ value: UInt64, modulus: UInt32) -> UInt64 {
+        guard modulus > 1 else { return 0 }
         let mapped = value % UInt64(modulus)
         return mapped == 0 ? 1 : mapped
     }

@@ -7,6 +7,7 @@ import AVFoundation
 import BitFoundation
 import Combine
 import Foundation
+import ImageIO
 import WatchKit
 
 enum WatchMediaKind: Equatable {
@@ -22,6 +23,29 @@ struct WatchMediaAttachment: Codable, Equatable {
     let byteCount: Int
     var isLive = false
 
+    /// App-container paths may change across updates and restores. Resolve
+    /// the archive's media location against the current Documents directory.
+    func restored(in documents: URL) -> WatchMediaAttachment {
+        let directory = url.deletingLastPathComponent()
+        guard url.isFileURL,
+              directory.deletingLastPathComponent().lastPathComponent == "Documents",
+              ["ReceivedMedia", "VoiceNotes"].contains(directory.lastPathComponent) else {
+            return self
+        }
+        let restoredURL = documents
+            .appendingPathComponent(directory.lastPathComponent, isDirectory: true)
+            .appendingPathComponent(url.lastPathComponent)
+        return WatchMediaAttachment(
+            url: restoredURL,
+            fileName: fileName,
+            mimeType: mimeType,
+            byteCount: isLive
+                ? ((try? restoredURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? byteCount)
+                : byteCount,
+            isLive: false
+        )
+    }
+
     var kind: WatchMediaKind {
         if mimeType.lowercased().hasPrefix("image/") { return .image }
         if mimeType.lowercased().hasPrefix("audio/") { return .audio }
@@ -32,6 +56,36 @@ struct WatchMediaAttachment: Codable, Equatable {
 enum WatchMediaStore {
     private static let maximumStoredBytes = 32 * 1_024 * 1_024
     private static let maximumStoredFiles = 256
+    private static let waveformBarCount = 32
+
+    private final class CachedImage: NSObject {
+        let image: UIImage
+
+        init(_ image: UIImage) {
+            self.image = image
+        }
+    }
+
+    private final class CachedWaveform: NSObject {
+        let samples: [Float]
+
+        init(_ samples: [Float]) {
+            self.samples = samples
+        }
+    }
+
+    private static let thumbnailCache: NSCache<NSString, CachedImage> = {
+        let cache = NSCache<NSString, CachedImage>()
+        cache.countLimit = 48
+        cache.totalCostLimit = 8 * 1_024 * 1_024
+        return cache
+    }()
+
+    private static let waveformCache: NSCache<NSString, CachedWaveform> = {
+        let cache = NSCache<NSString, CachedWaveform>()
+        cache.countLimit = maximumStoredFiles
+        return cache
+    }()
 
     struct RetentionCandidate {
         let url: URL
@@ -104,44 +158,118 @@ enum WatchMediaStore {
         try? FileManager.default.removeItem(at: attachment.url)
     }
 
-    static func compactWaveform(for url: URL, bars: Int = 32) -> [Float] {
-        guard bars > 0,
-              let file = try? AVAudioFile(forReading: url),
-              file.length > 0,
-              let capacity = AVAudioFrameCount(exactly: file.length),
+    static func placeholderWaveform(bars: Int = waveformBarCount) -> [Float] {
+        Array(repeating: 0.3, count: max(1, bars))
+    }
+
+    /// Produces a display-sized decode instead of constructing a full-
+    /// resolution bitmap on the watch. ImageIO also rejects malformed image
+    /// containers without pushing their decode work onto SwiftUI's main actor.
+    static func thumbnail(for url: URL, maximumPixelSize: Int) -> UIImage? {
+        guard maximumPixelSize > 0 else { return nil }
+        let key = cacheKey(for: url, discriminator: "image-\(maximumPixelSize)")
+        if let cached = thumbnailCache.object(forKey: key) {
+            return cached.image
+        }
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return nil
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maximumPixelSize,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        guard let decoded = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            options as CFDictionary
+        ) else {
+            return nil
+        }
+        let image = UIImage(cgImage: decoded)
+        let cost = decoded.bytesPerRow * decoded.height
+        thumbnailCache.setObject(CachedImage(image), forKey: key, cost: cost)
+        return image
+    }
+
+    /// Reads audio in small blocks. The previous implementation allocated a
+    /// PCM buffer for the entire file every time SwiftUI recreated a row,
+    /// which could multiply a compact transfer into tens of megabytes of
+    /// transient watch memory.
+    static func compactWaveform(
+        for url: URL,
+        bars: Int = waveformBarCount
+    ) -> [Float] {
+        guard bars > 0 else { return placeholderWaveform(bars: bars) }
+        let key = cacheKey(for: url, discriminator: "waveform-\(bars)")
+        if let cached = waveformCache.object(forKey: key) {
+            return cached.samples
+        }
+        guard let file = try? AVAudioFile(forReading: url),
+              let frameCount = Int(exactly: file.length),
+              frameCount > 0 else {
+            return placeholderWaveform(bars: bars)
+        }
+        let blockFrames = min(frameCount, 4_096)
+        guard let capacity = AVAudioFrameCount(exactly: blockFrames),
               let buffer = AVAudioPCMBuffer(
                 pcmFormat: file.processingFormat,
                 frameCapacity: capacity
               ) else {
-            return Array(repeating: 0.3, count: max(1, bars))
+            return placeholderWaveform(bars: bars)
         }
+
+        var sums = Array(repeating: Float.zero, count: bars)
+        var sampleCounts = Array(repeating: 0, count: bars)
+        var frameOffset = 0
         do {
-            try file.read(into: buffer)
-        } catch {
-            return Array(repeating: 0.3, count: bars)
-        }
-        guard let channels = buffer.floatChannelData,
-              buffer.frameLength > 0 else {
-            return Array(repeating: 0.3, count: bars)
-        }
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        let strideSize = max(1, frameCount / bars)
-        return (0..<bars).map { index in
-            let start = min(frameCount, index * strideSize)
-            let end = index == bars - 1
-                ? frameCount
-                : min(frameCount, start + strideSize)
-            guard start < end else { return 0.08 }
-            var sum: Float = 0
-            for frame in start..<end {
-                for channel in 0..<channelCount {
-                    sum += abs(channels[channel][frame])
+            while frameOffset < frameCount {
+                let remaining = min(blockFrames, frameCount - frameOffset)
+                guard let requested = AVAudioFrameCount(exactly: remaining) else {
+                    return placeholderWaveform(bars: bars)
                 }
+                try file.read(into: buffer, frameCount: requested)
+                let framesRead = Int(buffer.frameLength)
+                guard framesRead > 0,
+                      let channels = buffer.floatChannelData else { break }
+                let channelCount = max(1, Int(buffer.format.channelCount))
+                for localFrame in 0..<framesRead {
+                    let bar = min(
+                        bars - 1,
+                        (frameOffset + localFrame) * bars / frameCount
+                    )
+                    for channel in 0..<channelCount {
+                        sums[bar] += abs(channels[channel][localFrame])
+                    }
+                    sampleCounts[bar] += channelCount
+                }
+                frameOffset += framesRead
             }
-            let mean = sum / Float((end - start) * max(1, channelCount))
+        } catch {
+            return placeholderWaveform(bars: bars)
+        }
+
+        let samples = (0..<bars).map { index -> Float in
+            guard sampleCounts[index] > 0 else { return 0.08 }
+            let mean = sums[index] / Float(sampleCounts[index])
             return max(0.08, min(1, mean * 2.4))
         }
+        waveformCache.setObject(CachedWaveform(samples), forKey: key)
+        return samples
+    }
+
+    private static func cacheKey(
+        for url: URL,
+        discriminator: String
+    ) -> NSString {
+        let values = try? url.resourceValues(forKeys: [
+            .fileSizeKey,
+            .contentModificationDateKey
+        ])
+        let size = values?.fileSize ?? -1
+        let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? -1
+        return "\(discriminator)|\(url.standardizedFileURL.path)|\(size)|\(modified)" as NSString
     }
 
     /// Bounds watch storage while retaining every attachment still referenced
@@ -183,6 +311,8 @@ enum WatchMediaStore {
         }
         var totalBytes = files.reduce(0) { $0 + $1.size }
         var totalFiles = files.count
+        guard totalBytes > maximumStoredBytes
+                || totalFiles > maximumStoredFiles else { return 0 }
         var removed = 0
         for file in files.sorted(by: { $0.date < $1.date }) {
             guard totalBytes > maximumStoredBytes
@@ -227,6 +357,8 @@ enum WatchMediaStore {
 
         var totalBytes = unique.values.reduce(0) { $0 + $1.byteCount }
         var totalFiles = unique.count
+        guard totalBytes > maximumStoredBytes
+                || totalFiles > maximumStoredFiles else { return [] }
         var victims = Set<URL>()
         for candidate in unique.values.sorted(by: { $0.timestamp < $1.timestamp }) {
             guard totalBytes > maximumStoredBytes
@@ -256,7 +388,16 @@ enum WatchMediaStore {
         let sanitized = leaf.unicodeScalars.map { scalar -> Character in
             CharacterSet.controlCharacters.contains(scalar) ? "_" : Character(String(scalar))
         }
-        let bounded = String(String(sanitized).prefix(120))
+        // Filesystems limit names in bytes. 120 emoji can exceed that limit;
+        // leave room for uniqueURL's collision suffix as well.
+        var bounded = ""
+        var byteCount = 0
+        for character in sanitized.prefix(120) {
+            let count = String(character).utf8.count
+            guard byteCount + count <= 240 else { break }
+            bounded.append(character)
+            byteCount += count
+        }
         return hasUnsafePathMeaning || bounded.isEmpty
             ? "file-\(UUID().uuidString)"
             : bounded
@@ -681,6 +822,14 @@ final class WatchAudioPlayer: NSObject, ObservableObject {
             self.player = player
             duration = player.duration
         }
+    }
+
+    deinit {
+        // A repeating Timer is retained by the run loop. Explicitly invalidate
+        // it when its SwiftUI row disappears so navigating away mid-playback
+        // cannot leave a 10 Hz no-op wakeup behind.
+        timer?.invalidate()
+        player?.stop()
     }
 
     func toggle() {

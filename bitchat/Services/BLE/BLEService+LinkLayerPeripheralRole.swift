@@ -29,32 +29,25 @@ extension BLEService: CBPeripheralManagerDelegate {
                 peripheral.removeAllServices()
                 characteristic = nil
                 alertCharacteristic = nil
+                hasRestoredPeripheralGattService = false
                 return
             }
-            // Remove all services first to ensure clean state
-            peripheral.removeAllServices()
-
-            // Create characteristic
-            characteristic = CBMutableCharacteristic(
-                type: BLEService.characteristicUUID,
-                properties: [.notify, .write, .writeWithoutResponse, .read],
-                value: nil,
-                permissions: [.readable, .writeable]
-            )
-            alertCharacteristic = CBMutableCharacteristic(
-                type: BLEService.alertCharacteristicUUID,
-                properties: [.notify],
-                value: nil,
-                permissions: [.readable]
-            )
-
-            // Create service
-            let service = CBMutableService(type: BLEService.serviceUUID, primary: true)
-            service.characteristics = [characteristic!, alertCharacteristic!]
-
-            // Add service (advertising will start in didAdd delegate)
-            SecureLogger.debug("🔧 Adding BLE service...", category: .session)
-            peripheral.add(service)
+            if hasRestoredPeripheralGattService,
+               characteristic != nil,
+               alertCharacteristic != nil {
+                restoreSubscribersFromCurrentCharacteristics()
+                if !peripheral.isAdvertising {
+                    peripheral.startAdvertising(
+                        BLERadioController.advertisementData()
+                    )
+                }
+                SecureLogger.info(
+                    "♻️ Preserved restored GATT service and watch subscriptions",
+                    category: .session
+                )
+            } else {
+                publishPeripheralGattService(on: peripheral)
+            }
 
         case .poweredOff:
             // Bluetooth was turned off - clean up peripheral state
@@ -68,6 +61,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             subscriptionAnnounceLimiter.removeAll()
             characteristic = nil
             alertCharacteristic = nil
+            hasRestoredPeripheralGattService = false
             emitLinkEvent(.allCentralLinksEnded(centralUUIDs: centralIDs, retireProofsAndNotify: true))
 
         case .unauthorized:
@@ -77,6 +71,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             subscriptionAnnounceLimiter.removeAll()
             characteristic = nil
             alertCharacteristic = nil
+            hasRestoredPeripheralGattService = false
             emitLinkEvent(.allCentralLinksEnded(centralUUIDs: [], retireProofsAndNotify: false))
 
         case .unsupported:
@@ -94,6 +89,73 @@ extension BLEService: CBPeripheralManagerDelegate {
             SecureLogger.warning("⚠️ Unknown peripheral Bluetooth state: \(peripheral.state.rawValue)", category: .session)
         }
     }
+
+    private func publishPeripheralGattService(on peripheral: CBPeripheralManager) {
+        let previousCentralIDs = linkStateStore.allSubscribedCentrals.map {
+            $0.identifier.uuidString
+        }
+        peripheral.stopAdvertising()
+        peripheral.removeAllServices()
+        pendingNotifications.removeAll()
+        pendingAlertNotifications.removeAll()
+        pendingWriteBuffers.removeAll()
+        linkStateStore.clearCentrals()
+        hasRestoredPeripheralGattService = false
+
+        characteristic = CBMutableCharacteristic(
+            type: BLEService.characteristicUUID,
+            properties: [.notify, .write, .writeWithoutResponse, .read],
+            value: nil,
+            permissions: [.readable, .writeable]
+        )
+        // Indications are acknowledged at the ATT layer. Apple recommends
+        // them for watchOS timely alerts because a missed single wake packet
+        // cannot be recovered by a continuously running background process.
+        alertCharacteristic = CBMutableCharacteristic(
+            type: BLEService.alertCharacteristicUUID,
+            properties: [.indicate],
+            value: nil,
+            permissions: [.readable]
+        )
+
+        let service = CBMutableService(
+            type: BLEService.serviceUUID,
+            primary: true
+        )
+        service.characteristics = [characteristic!, alertCharacteristic!]
+        SecureLogger.debug("🔧 Adding BLE service...", category: .session)
+        peripheral.add(service)
+
+        if !previousCentralIDs.isEmpty {
+            emitLinkEvent(
+                .allCentralLinksEnded(
+                    centralUUIDs: previousCentralIDs,
+                    retireProofsAndNotify: true
+                )
+            )
+        }
+    }
+
+    private func restoreSubscribersFromCurrentCharacteristics() {
+        guard let characteristic, let alertCharacteristic else { return }
+        let primaryCentrals = characteristic.subscribedCentrals ?? []
+        let alertCentrals = alertCharacteristic.subscribedCentrals ?? []
+        linkStateStore.clearCentrals()
+        for central in primaryCentrals {
+            linkStateStore.addSubscribedCentral(central)
+        }
+        for central in alertCentrals {
+            linkStateStore.addAlertSubscribedCentral(central)
+        }
+        let centralUUIDs = linkStateStore.allSubscribedCentrals.map {
+            $0.identifier.uuidString
+        }
+        restoreCentralLinkBindingHints(forCentralUUIDs: centralUUIDs)
+        SecureLogger.info(
+            "♻️ Restored subscribers: mesh=\(primaryCentrals.count) alert=\(alertCentrals.count)",
+            category: .session
+        )
+    }
     
     #if os(iOS)
     func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
@@ -102,6 +164,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             peripheral.removeAllServices()
             characteristic = nil
             alertCharacteristic = nil
+            hasRestoredPeripheralGattService = false
             return
         }
         let restoredServices = (dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService]) ?? []
@@ -112,26 +175,38 @@ extension BLEService: CBPeripheralManagerDelegate {
             category: .session
         )
 
-        // Attempt to recover characteristic from restored services
-        if characteristic == nil {
-            if let service = restoredServices.first(where: { $0.uuid == BLEService.serviceUUID }),
-               let restoredCharacteristic = service.characteristics?.first(where: { $0.uuid == BLEService.characteristicUUID }) as? CBMutableCharacteristic {
-                characteristic = restoredCharacteristic
-            }
-        }
-        if alertCharacteristic == nil {
-            if let service = restoredServices.first(where: { $0.uuid == BLEService.serviceUUID }),
-               let restoredCharacteristic = service.characteristics?.first(where: {
-                   $0.uuid == BLEService.alertCharacteristicUUID
-               }) as? CBMutableCharacteristic {
-                alertCharacteristic = restoredCharacteristic
-            }
+        if let service = restoredServices.first(where: {
+            $0.uuid == BLEService.serviceUUID
+        }),
+           let restoredMesh = service.characteristics?.first(where: {
+               $0.uuid == BLEService.characteristicUUID
+           }) as? CBMutableCharacteristic,
+           let restoredAlert = service.characteristics?.first(where: {
+               $0.uuid == BLEService.alertCharacteristicUUID
+           }) as? CBMutableCharacteristic {
+            characteristic = restoredMesh
+            alertCharacteristic = restoredAlert
+            hasRestoredPeripheralGattService = true
+            restoreSubscribersFromCurrentCharacteristics()
+        } else {
+            // An older/incomplete schema cannot provide the dedicated alert
+            // lane. Let the powered-on callback rebuild it; connected watches
+            // receive didModifyServices and rediscover immediately.
+            characteristic = nil
+            alertCharacteristic = nil
+            hasRestoredPeripheralGattService = false
+            SecureLogger.warning(
+                "♻️ Restored GATT schema incomplete; rebuilding service",
+                category: .session
+            )
         }
 
         // Via the sampler for a fresh background budget (see central-restore).
         logBluetoothStatus("peripheral-restore")
 
-        if peripheral.state == .poweredOn && !peripheral.isAdvertising {
+        if hasRestoredPeripheralGattService,
+           peripheral.state == .poweredOn,
+           !peripheral.isAdvertising {
             peripheral.startAdvertising(BLERadioController.advertisementData())
         }
     }
@@ -219,6 +294,7 @@ extension BLEService: CBPeripheralManagerDelegate {
         // Preserve their authenticated identity and physical link while the
         // alert subscription remains alive.
         if !linkStateStore.hasAnySubscription(from: central) {
+            centralPeerRestorationHints.remove(centralUUID: centralID)
             emitLinkEvent(.centralLinkEnded(centralUUID: centralID))
         }
     }

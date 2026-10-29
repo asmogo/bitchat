@@ -74,6 +74,7 @@ struct ContentView: View {
             } else if !notificationPromptCompleted {
                 NotificationSetupView {
                     notificationPromptCompleted = true
+                    ble.refreshNotificationAuthorizationState()
                 }
             } else {
                 WatchNavigation(ble: ble)
@@ -82,10 +83,16 @@ struct ContentView: View {
         .background(Color.black.ignoresSafeArea())
         .onAppear {
             ble.start()
-            ble.setAppInForeground(scenePhase != .background)
+            ble.setApplicationState(
+                isForeground: scenePhase != .background,
+                isInteractive: scenePhase == .active
+            )
         }
         .onChange(of: scenePhase) { _, phase in
-            ble.setAppInForeground(phase != .background)
+            ble.setApplicationState(
+                isForeground: phase != .background,
+                isInteractive: phase == .active
+            )
         }
     }
 }
@@ -175,12 +182,13 @@ private struct ConversationView: View {
                                 .padding(.top, 18)
                                 .padding(.bottom, 28)
                         }
-                        ForEach(Array(thread.enumerated()), id: \.element.id) { index, message in
+                        let lastMessageID = thread.last?.id
+                        ForEach(thread) { message in
                             VStack(spacing: 0) {
                                 WatchMessageRow(message: message) { attachment in
                                     imageAttachment = attachment
                                 }
-                                if index == thread.count - 1 {
+                                if message.id == lastMessageID {
                                     Color.clear.frame(height: 60)
                                 }
                             }
@@ -1036,19 +1044,49 @@ private struct MediaMessageView: View {
 private struct WatchImageThumbnail: View {
     let attachment: WatchMediaAttachment
     let onOpen: () -> Void
+    @State private var image: UIImage?
+    @State private var loadFinished = false
 
     var body: some View {
-        if let image = UIImage(contentsOfFile: attachment.url.path) {
-            Image(uiImage: image)
-                .resizable()
-                .scaledToFill()
-                .frame(maxWidth: .infinity)
-                .frame(height: 96)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                .contentShape(RoundedRectangle(cornerRadius: 10))
-                .onTapGesture(perform: onOpen)
-        } else {
-            FileChip(attachment: attachment)
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 96)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .contentShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(perform: onOpen)
+            } else if loadFinished {
+                FileChip(attachment: attachment)
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 96)
+                    .background(
+                        WatchPalette.surface,
+                        in: RoundedRectangle(cornerRadius: 10)
+                    )
+            }
+        }
+        .task(id: attachment.url) {
+            image = nil
+            loadFinished = false
+            let url = attachment.url
+            let loaded = await Task.detached(priority: .utility) {
+                WatchMediaStore.thumbnail(for: url, maximumPixelSize: 256)
+            }.value
+            guard !Task.isCancelled else { return }
+            image = loaded
+            loadFinished = true
+        }
+        .onDisappear {
+            // Lazy stacks may preserve row state after it scrolls offscreen.
+            // Let the bounded NSCache own inactive thumbnails instead of
+            // retaining one bitmap in every historical message row.
+            image = nil
+            loadFinished = false
         }
     }
 }
@@ -1056,20 +1094,31 @@ private struct WatchImageThumbnail: View {
 private struct FullScreenImageView: View {
     let attachment: WatchMediaAttachment
     @Environment(\.dismiss) private var dismiss
+    @State private var image: UIImage?
 
     var body: some View {
         ZStack(alignment: .top) {
             Color.black.ignoresSafeArea()
-            if let image = UIImage(contentsOfFile: attachment.url.path) {
+            if let image {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ProgressView()
             }
             Image(systemName: "xmark.circle.fill")
                 .foregroundStyle(.white.opacity(0.75))
                 .onTapGesture { dismiss() }
                 .padding(.top, 5)
+        }
+        .task(id: attachment.url) {
+            let url = attachment.url
+            let loaded = await Task.detached(priority: .utility) {
+                WatchMediaStore.thumbnail(for: url, maximumPixelSize: 512)
+            }.value
+            guard !Task.isCancelled else { return }
+            image = loaded
         }
     }
 }
@@ -1077,12 +1126,11 @@ private struct FullScreenImageView: View {
 private struct VoiceNoteView: View {
     let attachment: WatchMediaAttachment
     @StateObject private var player: WatchAudioPlayer
-    private let samples: [Float]
+    @State private var samples = WatchMediaStore.placeholderWaveform()
 
     init(attachment: WatchMediaAttachment) {
         self.attachment = attachment
         _player = StateObject(wrappedValue: WatchAudioPlayer(url: attachment.url))
-        samples = WatchMediaStore.compactWaveform(for: attachment.url)
     }
 
     var body: some View {
@@ -1124,6 +1172,15 @@ private struct VoiceNoteView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(WatchPalette.surface, in: RoundedRectangle(cornerRadius: 12))
+        .task(id: attachment.url) {
+            guard !attachment.isLive else { return }
+            let url = attachment.url
+            let waveform = await Task.detached(priority: .utility) {
+                WatchMediaStore.compactWaveform(for: url)
+            }.value
+            guard !Task.isCancelled else { return }
+            samples = waveform
+        }
     }
 }
 
@@ -1242,6 +1299,13 @@ private struct DiagnosticsView: View {
             )
                 .font(.bitchat(8, weight: .medium))
                 .foregroundStyle(WatchPalette.tertiary)
+            Text("notifications \(ble.notificationAuthorizationState)")
+                .font(.bitchat(8, weight: .medium))
+                .foregroundStyle(
+                    ble.notificationAuthorizationState == "denied"
+                        ? .red
+                        : WatchPalette.tertiary
+                )
             Text(
                 "stage \(ble.connectionStageSummary)"
                     + " · recover \(ble.recoveryCount)/\(ble.phaseTimeoutCount)"
@@ -1256,10 +1320,11 @@ private struct DiagnosticsView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(Array(ble.logLines.enumerated()), id: \.offset) { index, line in
-                            Text(line)
+                        let lines = ble.logLines
+                        ForEach(lines.indices, id: \.self) { index in
+                            Text(lines[index])
                                 .font(.bitchat(9))
-                                .foregroundStyle(logColor(for: line))
+                                .foregroundStyle(logColor(for: lines[index]))
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .id(index)
                         }

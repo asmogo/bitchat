@@ -35,6 +35,31 @@ enum WatchMeshRuntimePolicy {
         let exponent = min(consecutiveFailures - 1, 6)
         return min(600, TimeInterval(15 * (1 << exponent)))
     }
+
+    /// A link that worked this recently was a backbone relay, not a dead
+    /// candidate: allow one otherwise-cooled retry. Repeated failures must
+    /// resume backoff or a departed relay can monopolize every connection
+    /// slot for the full recent-success window.
+    static let recentSuccessReconnectBypass: TimeInterval = 15 * 60
+    private static let recentSuccessBypassFailureLimit = 2
+
+    static func shouldSkipConnectionAttempt(
+        consecutiveFailures: Int,
+        lastFailureAt: Date?,
+        lastSuccessfulAt: Date?,
+        now: Date = Date()
+    ) -> Bool {
+        if consecutiveFailures <= recentSuccessBypassFailureLimit,
+           let lastSuccessfulAt,
+           now.timeIntervalSince(lastSuccessfulAt) < recentSuccessReconnectBypass {
+            return false
+        }
+        let cooldown = connectionRetryCooldown(
+            consecutiveFailures: consecutiveFailures
+        )
+        guard cooldown > 0, let lastFailureAt else { return false }
+        return now.timeIntervalSince(lastFailureAt) < cooldown
+    }
     static let serviceDiscoveryTimeout: TimeInterval = 15
     static let characteristicDiscoveryTimeout: TimeInterval = 15
     static let notificationSubscriptionTimeout: TimeInterval = 15

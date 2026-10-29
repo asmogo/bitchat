@@ -25,7 +25,12 @@ final class WatchKnownPeerStore {
     private let storageKey: String
     private let maximumPeers = 128
     private let retention: TimeInterval = 30 * 24 * 60 * 60
+    /// Announces refresh much more often than durable identity recovery needs.
+    /// Coalescing unchanged last-seen updates avoids encoding the whole peer
+    /// map and writing UserDefaults every time each neighbor heartbeats.
+    private let lastSeenPersistenceInterval: TimeInterval = 5 * 60
     private var records: [String: Record]
+    private var persistedAtByPeer: [String: Date]
 
     init(
         defaults: UserDefaults = .standard,
@@ -39,6 +44,7 @@ final class WatchKnownPeerStore {
         } else {
             records = [:]
         }
+        persistedAtByPeer = records.mapValues(\.lastSeen)
         prune(now: Date())
     }
 
@@ -62,18 +68,35 @@ final class WatchKnownPeerStore {
         guard peer.noisePublicKey.count == 32,
               PeerID(publicKey: peer.noisePublicKey) == peer.peerID,
               peer.signingPublicKey.count == 32 else { return }
-        records[peer.peerID.id] = Record(
+        let peerKey = peer.peerID.id
+        let nickname = String(
+            peer.nickname.precomposedStringWithCanonicalMapping.prefix(32)
+        )
+        let previous = records[peerKey]
+        let updatedLastSeen = max(previous?.lastSeen ?? .distantPast, peer.lastSeen)
+        let identityChanged = previous == nil
+            || previous?.nickname != nickname
+            || previous?.noisePublicKey != peer.noisePublicKey
+            || previous?.signingPublicKey != peer.signingPublicKey
+            || previous?.capabilities != peer.capabilities.rawValue
+        let lastPersistedAt = persistedAtByPeer[peerKey] ?? .distantPast
+        let lastSeenPersistenceDue = updatedLastSeen.timeIntervalSince(
+            lastPersistedAt
+        ) >= lastSeenPersistenceInterval
+
+        records[peerKey] = Record(
             peerID: peer.peerID,
-            nickname: String(
-                peer.nickname.precomposedStringWithCanonicalMapping.prefix(32)
-            ),
+            nickname: nickname,
             noisePublicKey: peer.noisePublicKey,
             signingPublicKey: peer.signingPublicKey,
-            lastSeen: peer.lastSeen,
+            lastSeen: updatedLastSeen,
             capabilities: peer.capabilities.rawValue
         )
-        prune(now: peer.lastSeen)
-        persist()
+        prune(now: updatedLastSeen)
+        guard identityChanged || lastSeenPersistenceDue else { return }
+        if persist() {
+            persistedAtByPeer[peerKey] = updatedLastSeen
+        }
     }
 
     private func prune(now: Date) {
@@ -87,10 +110,15 @@ final class WatchKnownPeerStore {
                 ($0.peerID.id, $0)
             })
         }
+        persistedAtByPeer = persistedAtByPeer.filter {
+            records[$0.key] != nil
+        }
     }
 
-    private func persist() {
-        guard let data = try? JSONEncoder().encode(records) else { return }
+    @discardableResult
+    private func persist() -> Bool {
+        guard let data = try? JSONEncoder().encode(records) else { return false }
         defaults.set(data, forKey: storageKey)
+        return true
     }
 }

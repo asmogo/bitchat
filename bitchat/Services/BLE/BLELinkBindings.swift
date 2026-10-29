@@ -150,3 +150,107 @@ struct BLELinkBindings {
         preferredPeripheral.removeAll()
     }
 }
+
+/// A Core Bluetooth restoration preserves subscribed `CBCentral` instances,
+/// but the process-local identity binding that tells us which peer owns each
+/// central otherwise disappears. Persist only a short-lived routing hint. It
+/// does not restore Noise authentication; a restored link must complete a new
+/// handshake before authenticated-only traffic can use it.
+final class BLECentralPeerRestorationHintStore {
+    private struct Entry: Codable {
+        let peerID: String
+        let updatedAt: Date
+    }
+
+    private let defaults: UserDefaults
+    private let storageKey: String
+    private let maximumAge: TimeInterval
+    private let maximumEntries: Int
+    private let lock = NSLock()
+
+    init(
+        defaults: UserDefaults = .standard,
+        storageKey: String = "ble.central-peer-restoration-hints.v1",
+        maximumAge: TimeInterval = 30 * 24 * 60 * 60,
+        maximumEntries: Int = 32
+    ) {
+        self.defaults = defaults
+        self.storageKey = storageKey
+        self.maximumAge = maximumAge
+        self.maximumEntries = maximumEntries
+    }
+
+    func remember(
+        centralUUID: String,
+        peerID: PeerID,
+        at now: Date = Date()
+    ) {
+        guard !centralUUID.isEmpty, !peerID.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        var entries = loadEntries()
+        prune(&entries, at: now)
+        if let existing = entries[centralUUID],
+           existing.peerID == peerID.id,
+           now.timeIntervalSince(existing.updatedAt) < 60 * 60 {
+            return
+        }
+        entries[centralUUID] = Entry(peerID: peerID.id, updatedAt: now)
+        if entries.count > maximumEntries {
+            for key in entries.sorted(by: { $0.value.updatedAt < $1.value.updatedAt })
+                .prefix(entries.count - maximumEntries)
+                .map(\.key) {
+                entries.removeValue(forKey: key)
+            }
+        }
+        save(entries)
+    }
+
+    func hints(
+        for centralUUIDs: [String],
+        at now: Date = Date()
+    ) -> [String: PeerID] {
+        lock.lock()
+        defer { lock.unlock() }
+        var entries = loadEntries()
+        let previousCount = entries.count
+        prune(&entries, at: now)
+        if entries.count != previousCount { save(entries) }
+        let requested = Set(centralUUIDs)
+        return entries.reduce(into: [:]) { result, pair in
+            guard requested.contains(pair.key) else { return }
+            let peerID = PeerID(str: pair.value.peerID)
+            guard !peerID.isEmpty else { return }
+            result[pair.key] = peerID
+        }
+    }
+
+    func remove(centralUUID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        var entries = loadEntries()
+        guard entries.removeValue(forKey: centralUUID) != nil else { return }
+        save(entries)
+    }
+
+    private func prune(_ entries: inout [String: Entry], at now: Date) {
+        entries = entries.filter {
+            now.timeIntervalSince($0.value.updatedAt) <= maximumAge
+                && now.timeIntervalSince($0.value.updatedAt) >= 0
+        }
+    }
+
+    private func loadEntries() -> [String: Entry] {
+        guard let data = defaults.data(forKey: storageKey),
+              let decoded = try? JSONDecoder().decode(
+                [String: Entry].self,
+                from: data
+              ) else { return [:] }
+        return decoded
+    }
+
+    private func save(_ entries: [String: Entry]) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        defaults.set(data, forKey: storageKey)
+    }
+}

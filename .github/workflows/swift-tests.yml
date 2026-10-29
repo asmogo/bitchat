@@ -149,13 +149,14 @@ jobs:
 
       - name: Build iOS (simulator, no signing)
         # Build both simulator architectures so CI validates every vendored
-        # Arti simulator slice and the configuration that ships.
+        # Arti simulator slice and the configuration that ships. Do not pass a
+        # global -sdk here: the scheme's embedded watch dependency must use
+        # watchsimulator while the companion app uses iphonesimulator.
         run: |
           set -o pipefail
           xcodebuild -project bitchat.xcodeproj \
             -scheme "bitchat (iOS)" \
             -configuration Release \
-            -sdk iphonesimulator \
             -destination 'generic/platform=iOS Simulator' \
             ARCHS='arm64 x86_64' \
             ONLY_ACTIVE_ARCH=NO \
@@ -174,17 +175,17 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-  # The SwiftPM matrix runs on macOS and cannot execute UIKit/CoreBluetooth
-  # conditional tests. Build the shared iOS test target and run it on the first
-  # available iPhone simulator from the runner image instead of hard-coding a
-  # model that changes when GitHub updates Xcode. The suite intentionally runs
-  # in one test runner: a number of integration tests exercise process-global
-  # stores and notification centers, so overlapping workers can corrupt each
-  # other's fixtures and turn sub-second tests into multi-minute timeouts.
+  # The SwiftPM matrix runs on macOS and cannot execute the platform test
+  # targets. Run them on the first available iPhone and Apple Watch simulators
+  # from the runner image instead of hard-coding models that change when GitHub
+  # updates Xcode. The suites intentionally run in one test runner: a number of
+  # integration tests exercise process-global stores and notification centers,
+  # so overlapping workers can corrupt each other's fixtures and turn
+  # sub-second tests into multi-minute timeouts.
   ios-tests:
-    name: Run iOS simulator tests
+    name: Run iOS and watchOS simulator tests
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout code
@@ -254,12 +255,85 @@ jobs:
           echo "id=$destination_id" >> "$GITHUB_OUTPUT"
 
       - name: Run iOS tests
+        # The destination selects the phone SDK while preserving the embedded
+        # watch target's own SDKROOT; a global -sdk causes duplicate products.
         run: |
           set -o pipefail
           xcodebuild -project bitchat.xcodeproj \
             -scheme "bitchat (iOS)" \
-            -sdk iphonesimulator \
             -destination "platform=iOS Simulator,id=${{ steps.destination.outputs.id }}" \
+            -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO \
+            test
+
+      - name: Select available Apple Watch simulator
+        id: watch_destination
+        run: |
+          set -uo pipefail
+          destinations=$(xcodebuild -project bitchat.xcodeproj -scheme "bitchat (watchOS)" -showdestinations 2>/dev/null || true)
+          destination_id=$(awk -F'id:' '
+            /platform:watchOS Simulator/ && /name:Apple Watch/ \
+              && !/error/ && !/unavailable/ && !found {
+              value=$2
+              sub(/,.*/, "", value)
+              gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+              print value
+              found=1
+            }
+          ' <<< "$destinations")
+
+          if [ -n "$destination_id" ]; then
+            echo "Selected destination via xcodebuild -showdestinations: $destination_id"
+          else
+            echo "No usable Apple Watch destination in -showdestinations output; falling back to simctl"
+            destination_id=$(xcrun simctl list devices available --json | jq -r '
+              [.devices | to_entries[]
+                | select(.key | contains("watchOS"))
+                | .value[]
+                | select(.isAvailable and (.name | startswith("Apple Watch")))]
+              | first.udid // empty')
+            if [ -n "$destination_id" ]; then
+              echo "Selected existing simctl device: $destination_id"
+            else
+              echo "No available Apple Watch simulator device; creating one"
+              # Newest installed watchOS runtime plus an Apple Watch device
+              # type that runtime reports as supported, so the pair match.
+              create_spec=$(xcrun simctl list runtimes --json | jq -r '
+                [.runtimes[]
+                  | select(.isAvailable
+                      and ((.platform // "") == "watchOS"
+                        or (.identifier | contains(".watchOS-"))))]
+                | sort_by(.version | split(".") | map(tonumber))
+                | last // empty
+                | .identifier as $runtime
+                | ([(.supportedDeviceTypes // [])[]
+                    | select((.productFamily // "") == "Apple Watch"
+                        or ((.name // "") | startswith("Apple Watch")))]
+                  | first.identifier // empty) as $devicetype
+                | "\($devicetype) \($runtime)"')
+              read -r devicetype runtime <<< "$create_spec" || true
+              if [ -z "${devicetype:-}" ] || [ -z "${runtime:-}" ]; then
+                echo "::error::No Apple Watch simulator destination found and none creatable (no installed watchOS runtime with an Apple Watch device type)"
+                exit 1
+              fi
+              destination_id=$(xcrun simctl create ci-apple-watch "$devicetype" "$runtime") || {
+                echo "::error::simctl create failed for $devicetype on $runtime"
+                exit 1
+              }
+              echo "Created simulator $destination_id ($devicetype, $runtime)"
+            fi
+          fi
+
+          echo "Using Apple Watch simulator destination id: $destination_id"
+          echo "id=$destination_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run watchOS tests
+        run: |
+          set -o pipefail
+          xcodebuild -project bitchat.xcodeproj \
+            -scheme "bitchat (watchOS)" \
+            -sdk watchsimulator \
+            -destination "platform=watchOS Simulator,id=${{ steps.watch_destination.outputs.id }}" \
             -parallel-testing-enabled NO \
             CODE_SIGNING_ALLOWED=NO \
             test
