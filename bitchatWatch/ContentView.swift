@@ -82,16 +82,10 @@ struct ContentView: View {
         }
         .background(Color.black.ignoresSafeArea())
         .onAppear {
-            ble.start()
+            ble.resumeIfEnabled()
             ble.setApplicationState(
                 isForeground: scenePhase != .background,
                 isInteractive: scenePhase == .active
-            )
-        }
-        .onChange(of: scenePhase) { _, phase in
-            ble.setApplicationState(
-                isForeground: phase != .background,
-                isInteractive: phase == .active
             )
         }
     }
@@ -1306,6 +1300,9 @@ private struct DiagnosticsView: View {
                         ? .red
                         : WatchPalette.tertiary
                 )
+            Text("refresh \(ble.backgroundRefreshState)")
+                .font(.bitchat(8, weight: .medium))
+                .foregroundStyle(WatchPalette.tertiary)
             Text(
                 "stage \(ble.connectionStageSummary)"
                     + " · recover \(ble.recoveryCount)/\(ble.phaseTimeoutCount)"

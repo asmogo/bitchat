@@ -13,6 +13,7 @@ import WatchKit
 @main
 struct BitchatWatchApp: App {
     @StateObject private var ble: WatchBLEController
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         UNUserNotificationCenter.current().delegate = WatchNotificationDelegate.shared
@@ -26,7 +27,7 @@ struct BitchatWatchApp: App {
             isForeground: state != .background,
             isInteractive: state == .active
         )
-        controller.start()
+        controller.resumeIfEnabled()
         _ble = StateObject(wrappedValue: controller)
     }
 
@@ -34,8 +35,19 @@ struct BitchatWatchApp: App {
         WindowGroup {
             ContentView(ble: ble)
         }
+        .onChange(of: scenePhase) { _, phase in
+            // Keep lifecycle handling alive even when a background launch
+            // never presents ContentView.
+            ble.setApplicationState(
+                isForeground: phase != .background,
+                isInteractive: phase == .active
+            )
+        }
         .backgroundTask(.bluetoothAlert) {
             await ble.handleBluetoothBackgroundWake()
+        }
+        .backgroundTask(.appRefresh(WatchBackgroundRefreshSchedule.identifier)) { _ in
+            await ble.handleBackgroundRefresh()
         }
     }
 }

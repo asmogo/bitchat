@@ -108,6 +108,9 @@ final class WatchBLEController: NSObject, ObservableObject {
     @Published private(set) var activePublicVoiceTalker: String?
     @Published private(set) var backgroundAlertState = "idle"
     @Published private(set) var notificationAuthorizationState = "checking"
+    @Published private(set) var backgroundRefreshState = "not scheduled"
+    private var backgroundRefreshSchedule = WatchBackgroundRefreshSchedule()
+    private static let meshStoppedKey = "watch_mesh_stopped"
 
     private var centralManager: CBCentralManager!
     private var peripherals: [UUID: CBPeripheral] = [:]
@@ -335,6 +338,14 @@ final class WatchBLEController: NSObject, ObservableObject {
     // MARK: - Lifecycle
 
     func start() {
+        UserDefaults.standard.set(false, forKey: Self.meshStoppedKey)
+        resumeIfEnabled()
+    }
+
+    func resumeIfEnabled() {
+        // A scheduled refresh must not undo an explicit Stop in diagnostics,
+        // including after the OS terminates and relaunches the process.
+        guard !UserDefaults.standard.bool(forKey: Self.meshStoppedKey) else { return }
         guard !running else { return }
         guard identity.hasPersistentKeys else {
             centralState = "identityUnavailable"
@@ -352,6 +363,7 @@ final class WatchBLEController: NSObject, ObservableObject {
         lastBluetoothProgressAt = Date()
         refreshScanWatchdog()
         makeCentralManager()
+        scheduleBackgroundRefreshIfNeeded()
     }
 
     private func makeCentralManager() {
@@ -366,6 +378,8 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     func stop() {
+        UserDefaults.standard.set(true, forKey: Self.meshStoppedKey)
+        backgroundRefreshState = "paused"
         guard running else { return }
         flushConversationPersistence()
         running = false
@@ -433,11 +447,62 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     func setApplicationState(isForeground: Bool, isInteractive: Bool) {
+        let wasInteractive = isAppInteractive
+        let wasForeground = isAppInForeground
         self.isAppInteractive = isForeground && isInteractive
+        if wasForeground != isForeground || wasInteractive != self.isAppInteractive {
+            log("app state: \(isForeground ? (self.isAppInteractive ? "active" : "inactive") : "background")")
+        }
         if self.isAppInteractive {
             refreshNotificationAuthorizationState()
         }
         setAppInForeground(isForeground)
+        if self.isAppInteractive && !wasInteractive {
+            acknowledgeVisibleConversation()
+        }
+        scheduleBackgroundRefreshIfNeeded()
+    }
+
+    private func scheduleBackgroundRefreshIfNeeded() {
+        guard running, !WatchDemoMode.isEnabled,
+              let date = backgroundRefreshSchedule.requestDate() else { return }
+        WKApplication.shared().scheduleBackgroundRefresh(
+            withPreferredDate: date,
+            userInfo: WatchBackgroundRefreshSchedule.identifier as NSString
+        ) { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                // A previous request can finish after a newer one replaced it.
+                guard self.backgroundRefreshSchedule.preferredDate == date else { return }
+                if let error {
+                    self.backgroundRefreshSchedule.requestFailed(for: date)
+                    self.backgroundRefreshState = self.running ? "unavailable" : "paused"
+                    self.log("background refresh scheduling failed: \(error.localizedDescription)")
+                } else if self.running {
+                    self.backgroundRefreshState = "scheduled"
+                }
+            }
+        }
+    }
+
+    func handleBackgroundRefresh() async {
+        let shouldRecover = await MainActor.run {
+            backgroundRefreshSchedule.taskDelivered()
+            guard running else { return false }
+            scheduleBackgroundRefreshIfNeeded()
+            guard WKApplication.shared().applicationState != .active else { return false }
+            backgroundRefreshState = "recovering"
+            log("background refresh: recovering known links")
+            return true
+        }
+        guard shouldRecover else { return }
+        // Reuse the bounded, cancellation-aware drain. No background scan,
+        // gossip burst, or timer is left running after granted runtime ends.
+        await handleBluetoothBackgroundWake()
+        await MainActor.run {
+            backgroundRefreshState = running ? "waiting for system" : "paused"
+            log("background refresh completed")
+        }
     }
 
     func refreshNotificationAuthorizationState() {
@@ -453,6 +518,10 @@ final class WatchBLEController: NSObject, ObservableObject {
 
     private func setAppInForeground(_ foreground: Bool) {
         guard foreground != isAppInForeground else {
+            // Lowering the wrist keeps the app frontmost. It is not a resume:
+            // forcing gossip and fragment resync here floods the links just
+            // as the screen dims, delaying DMs and wasting radio runtime.
+            if foreground && !isAppInteractive { return }
             if foreground {
                 adoptSystemConnectedPeripherals()
                 expireStalledConnectionPhases(now: Date())
@@ -461,7 +530,7 @@ final class WatchBLEController: NSObject, ObservableObject {
                 performGrantedRuntimeMaintenance(force: true)
             } else {
                 adoptSystemConnectedPeripherals()
-                setFullMeshNotifications(enabled: false)
+                setFullMeshNotifications(enabled: backgroundDrainActive)
                 enforceBackgroundConnectionBudget()
                 resumeKnownPeripherals()
                 reconcileDiscoveryState()
@@ -511,7 +580,8 @@ final class WatchBLEController: NSObject, ObservableObject {
                   peripheral.state == .connected else { continue }
             let hasAlertLane = alertCharacteristics[uuid] != nil
             let target = enabled || !WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
-                hasAlertLane: hasAlertLane
+                hasAlertLane: hasAlertLane,
+                isAlertLaneSubscribed: alertCharacteristics[uuid]?.isNotifying == true
             )
             if !enabled, !hasAlertLane {
                 legacyLanesKept += 1
@@ -538,7 +608,10 @@ final class WatchBLEController: NSObject, ObservableObject {
     }
 
     private func desiredMeshNotificationState(for uuid: UUID) -> Bool {
-        alertCharacteristics[uuid] == nil
+        !WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
+            hasAlertLane: alertCharacteristics[uuid] != nil,
+            isAlertLaneSubscribed: alertCharacteristics[uuid]?.isNotifying == true
+        )
             || isAppInForeground
             || backgroundDrainActive
     }
@@ -603,7 +676,7 @@ final class WatchBLEController: NSObject, ObservableObject {
             return WatchBackgroundRelayCandidate(
                 id: id,
                 peerID: directPeerByLink[id]?.id ?? historicalPeerID,
-                supportsAlertLane: alertCharacteristics[id] != nil,
+                supportsAlertLane: alertCharacteristics[id]?.isNotifying == true,
                 rssi: peripheralRSSI[id] ?? -100,
                 connectedAt: connectedAt[id] ?? .distantPast
             )
@@ -815,6 +888,7 @@ final class WatchBLEController: NSObject, ObservableObject {
     /// flows for the drain window — without spending further budget on
     /// gossip-sync request bursts, which stay foreground-only.
     func handleBluetoothBackgroundWake() async {
+        guard await MainActor.run(body: { running }) else { return }
         let alertTicket = bluetoothAlertGate.arm()
         await MainActor.run {
             // A bluetoothAlert task can be delivered while the UI is active.
@@ -830,7 +904,6 @@ final class WatchBLEController: NSObject, ObservableObject {
                 liveVoiceCoordinator.setAppInForeground(false)
             }
             backgroundAlertState = "waiting"
-            if !running { start() }
             adoptSystemConnectedPeripherals()
             enforceBackgroundConnectionBudget()
             // Hung connection attempts only time out when runtime is granted;
@@ -970,6 +1043,16 @@ final class WatchBLEController: NSObject, ObservableObject {
 
     func openDirectMessage(_ peerID: PeerID) {
         activeDMPeer = peerID
+        acknowledgeVisibleConversation()
+        if isAppInteractive {
+            initiateNoiseHandshake(with: peerID)
+        }
+    }
+
+    private func acknowledgeVisibleConversation() {
+        // SwiftUI may reconstruct a conversation during a background launch.
+        // Appearance alone must not clear its alerts or send read receipts.
+        guard isAppInteractive, let peerID = activeDMPeer else { return }
         unreadDms.removeValue(forKey: peerID.id)
         sortPeers()
         WatchNotifications.clearConversation(peerID.id)
@@ -977,7 +1060,6 @@ final class WatchBLEController: NSObject, ObservableObject {
         where !message.isSelf && message.supportsReceipts {
             sendReadReceiptIfNeeded(messageID: message.id, to: peerID)
         }
-        initiateNoiseHandshake(with: peerID)
     }
 
     func closeDirectMessage(_ peerID: PeerID) {
@@ -4478,6 +4560,13 @@ extension WatchBLEController: CBPeripheralDelegate {
                     )
                 }
                 return
+            }
+            if let mesh = writableCharacteristics[uuid] {
+                _ = requestMeshNotificationState(
+                    desiredMeshNotificationState(for: uuid),
+                    for: peripheral,
+                    characteristic: mesh
+                )
             }
             markLinkReady(peripheral)
             return

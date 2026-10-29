@@ -107,12 +107,38 @@ enum WatchMeshRuntimePolicy {
         isAppInForeground
     }
 
-    /// A link without a dedicated alert characteristic has no other wake
-    /// path. Quieting its mesh subscription wrist-down would make the watch
-    /// permanently deaf to that legacy peer, so only alert-capable links are
-    /// reduced to the alert lane.
-    static func shouldQuietMeshLaneInBackground(hasAlertLane: Bool) -> Bool {
-        hasAlertLane
+    /// Discovery is not a subscription: keep the existing receive path until
+    /// Core Bluetooth confirms the alert lane is actually notifying. This
+    /// also preserves the only wake path for legacy peers.
+    static func shouldQuietMeshLaneInBackground(
+        hasAlertLane: Bool,
+        isAlertLaneSubscribed: Bool
+    ) -> Bool {
+        hasAlertLane && isAlertLaneSubscribed
+    }
+}
+
+/// Keep one pending system refresh rather than postponing it on every scene
+/// transition. watchOS decides whether and when to grant the request.
+struct WatchBackgroundRefreshSchedule {
+    static let identifier = "chat.bitchat.watch.mesh-refresh"
+    static let interval: TimeInterval = 15 * 60
+    private(set) var preferredDate: Date?
+
+    mutating func requestDate(now: Date = Date()) -> Date? {
+        if let preferredDate, preferredDate > now { return nil }
+        let date = now.addingTimeInterval(Self.interval)
+        preferredDate = date
+        return date
+    }
+
+    mutating func requestFailed(for date: Date) {
+        guard preferredDate == date else { return }
+        preferredDate = nil
+    }
+
+    mutating func taskDelivered() {
+        preferredDate = nil
     }
 }
 

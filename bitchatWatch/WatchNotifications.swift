@@ -21,7 +21,9 @@ final class WatchNotificationDelegate: NSObject, UNUserNotificationCenterDelegat
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
-        [.banner, .sound]
+        // Frontmost-but-inactive apps also receive this callback. Keep an
+        // unread alert in Notification Center when its banner is not seen.
+        [.banner, .list, .sound]
     }
 
     func userNotificationCenter(

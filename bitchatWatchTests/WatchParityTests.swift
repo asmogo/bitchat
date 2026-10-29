@@ -361,11 +361,44 @@ struct WatchParityTests {
     @Test("legacy links without an alert lane keep their background wake path")
     func legacyBackgroundLanePolicy() {
         #expect(WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
-            hasAlertLane: true
+            hasAlertLane: true, isAlertLaneSubscribed: true
         ))
         #expect(!WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
-            hasAlertLane: false
+            hasAlertLane: false, isAlertLaneSubscribed: false
         ))
+    }
+
+    @Test("background handover keeps receiving until the alert subscription succeeds")
+    func pendingBackgroundAlertSubscription() {
+        #expect(!WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
+            hasAlertLane: true, isAlertLaneSubscribed: false
+        ))
+        #expect(!WatchMeshRuntimePolicy.shouldQuietMeshLaneInBackground(
+            hasAlertLane: false, isAlertLaneSubscribed: true
+        ))
+    }
+
+    @Test("scene transitions do not postpone a pending background refresh")
+    func backgroundRefreshScheduling() throws {
+        var schedule = WatchBackgroundRefreshSchedule()
+        let now = Date(timeIntervalSince1970: 1_000)
+        let firstRequest = schedule.requestDate(now: now)
+        let first = try #require(firstRequest)
+        #expect(first == now.addingTimeInterval(15 * 60))
+        #expect(schedule.requestDate(now: now.addingTimeInterval(60)) == nil)
+        #expect(schedule.preferredDate == first)
+
+        // Foreground use can make the OS discard a due refresh. Leaving the
+        // app later must request a new opportunity instead of staying stuck.
+        let replacementRequest = schedule.requestDate(now: first)
+        let replacement = try #require(replacementRequest)
+        schedule.requestFailed(for: first)
+        #expect(schedule.preferredDate == replacement)
+        schedule.requestFailed(for: replacement)
+        #expect(schedule.requestDate(now: first) == replacement)
+
+        schedule.taskDelivered()
+        #expect(schedule.requestDate(now: first.addingTimeInterval(30)) != nil)
     }
 
     @Test("unreachable candidates cool down instead of starving connection slots")

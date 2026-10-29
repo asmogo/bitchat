@@ -88,11 +88,16 @@ watch process is suspended:
 - each ready link announces and requests gossip sync, so reconnection fetches
   messages without requiring an app restart.
 
-The Always-On blur state (scene `.inactive`) is treated as foreground for the
+The Always-On state (scene `.inactive`) is treated as foreground for the
 transport but not as interactive for notification/read-receipt policy.
 Lowering the wrist to a dimmed screen must not tear down links, but a message
 received while the conversation is no longer actually visible must still post
-a notification. Only a real scene-background transition reduces the transport,
+a notification. The inactive transition does not trigger a new gossip or fragment
+resync burst. Lifecycle changes are observed at the app scene, including launches
+which never present the conversation view. Recreating an inactive conversation
+does not clear its notifications or send read receipts; those wait until it is
+interactive. Frontmost notifications are also retained in Notification Center.
+Only a real scene-background transition reduces the transport,
 and even then links with in-flight fragment assemblies are kept until the
 transfer completes.
 
@@ -105,6 +110,10 @@ permanently alert-only; a transition that produces no delegate callback is
 also timed out and rebuilt. If the phone invalidates/rebuilds its GATT service,
 the watch discards every stale characteristic reference and immediately
 rediscovers/subscribes on the existing connection.
+The full-mesh lane stays subscribed until Core Bluetooth confirms that the
+dedicated alert subscription is active. Merely discovering an alert characteristic
+does not establish a wake path. Once the alert subscription succeeds, the mesh
+lane converges to the current foreground/background state.
 
 Notification authorization is checked at launch and whenever the UI becomes
 interactive. Mesh diagnostics reports `enabled`, `denied`, or `not requested`
@@ -141,6 +150,26 @@ but it cannot remove the operating-system limit.
 Dispatch timers for announce heartbeats, retries, watchdogs, and fragment
 recovery do not run while suspended; they catch up at the next granted
 Bluetooth or foreground runtime.
+
+The app also requests a background refresh no earlier than fifteen minutes
+later and renews the request when delivered. Frequent wrist/scene transitions
+do not keep pushing the pending request back. When watchOS grants that runtime,
+the app resumes known connections and runs the same bounded message drain,
+then restores alert-only subscriptions. It does not scan or initiate gossip
+bursts during this recovery pass. This is a fallback opportunity, not a
+fifteen-minute polling guarantee: watchOS controls eligibility, timing, and
+throttling, and allocates substantially more refresh time to frontmost apps or
+apps with an active complication. This app currently has no complication.
+An explicit Stop in diagnostics persists across background relaunches; a refresh
+does not silently restart the mesh.
+
+There is no WatchConnectivity packet transport in this implementation. A paired
+iPhone can act as an ordinary BLE relay, and iOS notifications can be forwarded
+by the system, but that does not synchronize the Watch's separate encrypted
+inbox. A future companion transport would need to carry authenticated/encrypted
+packets and preserve deduplication, bounded queues, and the standalone identity;
+it must not advertise continuous or immediate delivery from WatchConnectivity,
+whose background transfers are also system-scheduled.
 
 Release validation must therefore include physical-device tests for:
 
